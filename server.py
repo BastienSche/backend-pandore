@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Request, Header, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -26,6 +26,7 @@ except ImportError:
     CheckoutSessionRequest = None
 import aiofiles
 import shutil
+from urllib.parse import urlencode
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -41,6 +42,12 @@ JWT_ALGORITHM = os.environ.get('JWT_ALGORITHM', 'HS256')
 
 # Stripe Configuration
 STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY')
+
+# Google OAuth Configuration
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
+FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
 
 # Create uploads directory
 UPLOADS_DIR = ROOT_DIR / "uploads"
@@ -83,6 +90,10 @@ class UserResponse(BaseModel):
 
 class GoogleSessionRequest(BaseModel):
     session_id: str
+
+class GoogleAuthCodeRequest(BaseModel):
+    code: str
+    state: Optional[str] = None
 
 class GoogleSessionResponse(BaseModel):
     user_id: str
@@ -195,6 +206,16 @@ def create_jwt_token(user_id: str) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+def ensure_google_oauth_configured():
+    if not GOOGLE_OAUTH_CLIENT_ID or not GOOGLE_OAUTH_CLIENT_SECRET or not GOOGLE_OAUTH_REDIRECT_URI:
+        raise HTTPException(status_code=500, detail="Google OAuth is not configured")
+
+def validate_oauth_state(request: Request, state: Optional[str]):
+    expected_state = request.cookies.get("oauth_state") if request else None
+    if expected_state:
+        if not state or state != expected_state:
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
 async def get_current_user(authorization: Optional[str] = Header(None), request: Request = None) -> dict:
     """Get current user from JWT token in Authorization header or session_token cookie"""
     token = None
@@ -299,60 +320,167 @@ async def login(credentials: UserLogin, response: Response):
         "user": UserResponse(**user_doc)
     }
 
-@api_router.post("/auth/google/callback", response_model=GoogleSessionResponse)
-async def google_callback(session_request: GoogleSessionRequest, response: Response):
-    """Exchange session_id for user data and create/update user"""
-    # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+@api_router.get("/auth/google/login")
+async def google_login():
+    """Redirect user to Google OAuth consent screen"""
+    ensure_google_oauth_configured()
+    state = uuid.uuid4().hex
+    params = {
+        "client_id": GOOGLE_OAUTH_CLIENT_ID,
+        "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "online",
+        "prompt": "consent",
+    }
+    url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    response = RedirectResponse(url=url)
+    response.set_cookie(
+        key="oauth_state",
+        value=state,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
+        max_age=10 * 60,
+    )
+    return response
+
+async def exchange_google_code_for_user(code: str) -> dict:
+    """Exchange authorization code for userinfo"""
+    ensure_google_oauth_configured()
     import aiohttp
     async with aiohttp.ClientSession() as session:
-        async with session.get(
-            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-            headers={"X-Session-ID": session_request.session_id}
+        async with session.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_OAUTH_CLIENT_ID,
+                "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI,
+            },
         ) as resp:
             if resp.status != 200:
-                raise HTTPException(status_code=401, detail="Invalid session_id")
-            data = await resp.json()
-    
-    # Check if user exists
-    user_doc = await db.users.find_one({"email": data["email"]}, {"_id": 0})
-    
+                raise HTTPException(status_code=401, detail="Token exchange failed")
+            token_data = await resp.json()
+
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise HTTPException(status_code=401, detail="Missing access token")
+
+        async with session.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        ) as resp:
+            if resp.status != 200:
+                raise HTTPException(status_code=401, detail="Failed to fetch user info")
+            return await resp.json()
+
+async def upsert_google_user(user_info: dict) -> dict:
+    """Create or update a user from Google profile data"""
+    user_doc = await db.users.find_one({"email": user_info["email"]}, {"_id": 0})
     if not user_doc:
-        # Create new user
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         user_doc = {
             "user_id": user_id,
-            "email": data["email"],
+            "email": user_info["email"],
             "password_hash": None,
-            "name": data["name"],
-            "picture": data.get("picture"),
+            "name": user_info.get("name") or user_info.get("given_name") or "",
+            "picture": user_info.get("picture"),
             "role": "user",
             "artist_name": None,
-            "created_at": datetime.now(timezone.utc).isoformat()
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await db.users.insert_one(user_doc)
     else:
-        # Update user info
         user_id = user_doc["user_id"]
         await db.users.update_one(
             {"user_id": user_id},
             {"$set": {
-                "name": data["name"],
-                "picture": data.get("picture")
-            }}
+                "name": user_info.get("name") or user_info.get("given_name") or user_doc.get("name"),
+                "picture": user_info.get("picture"),
+            }},
         )
-    
-    # Store session
-    session_token = data["session_token"]
+    user_doc["user_id"] = user_id
+    return user_doc
+
+async def create_google_session(user_id: str) -> str:
+    session_token = uuid.uuid4().hex
     session_doc = {
         "user_id": user_id,
         "session_token": session_token,
         "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    
-    # Delete old sessions for this user
     await db.user_sessions.delete_many({"user_id": user_id})
     await db.user_sessions.insert_one(session_doc)
+    return session_token
+
+@api_router.get("/auth/google/callback")
+async def google_callback_redirect(
+    request: Request,
+    response: Response,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    """Handle Google redirect and then redirect back to frontend"""
+    if error:
+        raise HTTPException(status_code=401, detail=error)
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing code")
+
+    validate_oauth_state(request, state)
+    user_info = await exchange_google_code_for_user(code)
+    user_doc = await upsert_google_user(user_info)
+    session_token = await create_google_session(user_doc["user_id"])
+
+    redirect_url = FRONTEND_OAUTH_REDIRECT_URL
+    if redirect_url:
+        response = RedirectResponse(url=redirect_url)
+        response.set_cookie(
+            key="session_token",
+            value=session_token,
+            httponly=False,
+            secure=False,
+            samesite="lax",
+            path="/",
+            max_age=7 * 24 * 60 * 60,
+        )
+        response.delete_cookie(key="oauth_state", path="/")
+        return response
+
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=False,
+        secure=False,
+        samesite="lax",
+        path="/",
+        max_age=7 * 24 * 60 * 60,
+    )
+    response.delete_cookie(key="oauth_state", path="/")
+    return GoogleSessionResponse(
+        user_id=user_doc["user_id"],
+        email=user_doc["email"],
+        name=user_doc["name"],
+        picture=user_doc.get("picture"),
+        session_token=session_token,
+    )
+
+@api_router.post("/auth/google/callback", response_model=GoogleSessionResponse)
+async def google_callback_api(
+    request: Request,
+    response: Response,
+    payload: GoogleAuthCodeRequest,
+):
+    """Exchange authorization code for user data and create/update user"""
+    validate_oauth_state(request, payload.state)
+    user_info = await exchange_google_code_for_user(payload.code)
+    user_doc = await upsert_google_user(user_info)
+    session_token = await create_google_session(user_doc["user_id"])
     
     # Set cookie
     response.set_cookie(
@@ -365,12 +493,13 @@ async def google_callback(session_request: GoogleSessionRequest, response: Respo
         max_age=7*24*60*60
     )
     
+    response.delete_cookie(key="oauth_state", path="/")
     return GoogleSessionResponse(
-        user_id=user_id,
-        email=data["email"],
-        name=data["name"],
-        picture=data.get("picture"),
-        session_token=session_token
+        user_id=user_doc["user_id"],
+        email=user_doc["email"],
+        name=user_doc["name"],
+        picture=user_doc.get("picture"),
+        session_token=session_token,
     )
 
 @api_router.get("/auth/me", response_model=UserResponse)

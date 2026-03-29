@@ -67,6 +67,15 @@ def ensure_stripe_available():
             detail="Stripe integration unavailable. Install emergentintegrations to enable payments.",
         )
 
+def is_free_item_price(price) -> bool:
+    """Prix stocké en centimes, aligné avec le frontend (`isFreePrice`)."""
+    try:
+        cents = float(price or 0)
+    except (TypeError, ValueError):
+        cents = 0.0
+    euros = cents / 100.0
+    return f"{euros:.2f}" == "0.00"
+
 # ==================== MODELS ====================
 
 class UserRegister(BaseModel):
@@ -153,8 +162,43 @@ class AlbumResponse(BaseModel):
     likes_count: int
     created_at: str
 
+class AlbumTrackCreate(BaseModel):
+    title: str
+    price: float  # Prix en cents
+    genre: str
+    description: Optional[str] = None
+    preview_start_time: int = 0
+    duration_sec: Optional[int] = None
+    mastering: Optional[dict] = None
+    splits: Optional[List[dict]] = None
+    status: str = "draft"
+
+class AlbumTrackResponse(BaseModel):
+    track_id: str
+    album_id: str
+    title: str
+    artist_id: str
+    artist_name: str
+    price: float
+    duration: Optional[int]
+    preview_url: str
+    preview_start_time: int
+    preview_duration: int
+    cover_url: Optional[str]
+    genre: str
+    description: Optional[str]
+    mastering: Optional[dict]
+    splits: Optional[List[dict]]
+    status: str
+    likes_count: int
+    created_at: str
+
 class PlaylistCreate(BaseModel):
     name: str
+    description: Optional[str] = None
+
+class PlaylistUpdate(BaseModel):
+    name: Optional[str] = None
     description: Optional[str] = None
 
 class PlaylistResponse(BaseModel):
@@ -169,6 +213,9 @@ class PlaylistResponse(BaseModel):
 class LikeRequest(BaseModel):
     item_type: Literal["track", "album", "artist"]
     item_id: str
+
+class LikesStateResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 class ArtistProfileCreate(BaseModel):
     name: str
@@ -190,6 +237,23 @@ class CheckoutRequest(BaseModel):
     item_type: Literal["track", "album"]
     item_id: str
     origin_url: str
+
+class AddToLibraryRequest(BaseModel):
+    item_type: Literal["track", "album"]
+    item_id: str
+
+class FollowRequest(BaseModel):
+    artist_id: str
+
+class UserSettings(BaseModel):
+    autoplay: bool = True
+    normalize_volume: bool = True
+    high_quality_streaming: bool = True
+    notifications_new_releases: bool = True
+    notifications_recommendations: bool = True
+    notifications_purchases: bool = True
+    privacy_share_listening_activity: bool = False
+    privacy_personalized_ads: bool = False
 
 # ==================== AUTH HELPERS ====================
 
@@ -506,6 +570,28 @@ async def google_callback_api(
 async def get_me(authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
     return UserResponse(**user)
+
+# ==================== USER SETTINGS ROUTES ====================
+
+@api_router.get("/users/me/settings", response_model=UserSettings)
+async def get_user_settings(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    doc = await db.user_settings.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if not doc:
+        return UserSettings()
+    # Filter to known fields
+    allowed = UserSettings().model_dump().keys()
+    data = {k: doc.get(k) for k in allowed if k in doc}
+    return UserSettings(**data)
+
+@api_router.put("/users/me/settings", response_model=UserSettings)
+async def update_user_settings(payload: UserSettings, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    data = payload.model_dump()
+    data["user_id"] = user["user_id"]
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.user_settings.update_one({"user_id": user["user_id"]}, {"$set": data}, upsert=True)
+    return payload
 
 @api_router.post("/auth/logout")
 async def logout(response: Response, authorization: Optional[str] = Header(None), request: Request = None):
@@ -837,6 +923,69 @@ async def update_album(album_id: str, album_data: dict, authorization: Optional[
     updated_album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
     return AlbumResponse(**updated_album)
 
+@api_router.post("/albums/{album_id}/tracks", response_model=AlbumTrackResponse)
+async def create_album_track(album_id: str, track_data: AlbumTrackCreate, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+
+    album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+
+    if album["artist_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    track_id = f"track_{uuid.uuid4().hex[:12]}"
+
+    track_doc = {
+        "track_id": track_id,
+        "title": track_data.title,
+        "artist_id": user["user_id"],
+        "artist_name": user["artist_name"],
+        "album_id": album_id,
+        "price": track_data.price,
+        "duration": track_data.duration_sec,
+        "preview_url": "",
+        "preview_start_time": track_data.preview_start_time,
+        "preview_duration": 15,
+        "file_url": "",
+        "cover_url": None,
+        "genre": track_data.genre,
+        "description": track_data.description,
+        "mastering": track_data.mastering,
+        "splits": track_data.splits or [],
+        "status": track_data.status,
+        "likes_count": 0,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    await db.tracks.insert_one(track_doc)
+
+    # add to album.track_ids
+    await db.albums.update_one(
+        {"album_id": album_id},
+        {"$addToSet": {"track_ids": track_id}}
+    )
+
+    return AlbumTrackResponse(**track_doc)
+
+@api_router.put("/albums/{album_id}/tracks/{track_id}", response_model=AlbumTrackResponse)
+async def update_album_track(album_id: str, track_id: str, payload: dict, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+
+    album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+    if album["artist_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    track = await db.tracks.find_one({"track_id": track_id, "album_id": album_id}, {"_id": 0})
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found in this album")
+
+    await db.tracks.update_one({"track_id": track_id}, {"$set": payload})
+    updated = await db.tracks.find_one({"track_id": track_id}, {"_id": 0})
+    return AlbumTrackResponse(**updated)
+
 # ==================== ARTIST ROUTES ====================
 
 @api_router.get("/artists")
@@ -888,6 +1037,38 @@ async def get_playlists(authorization: Optional[str] = Header(None), request: Re
     playlists = await db.playlists.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(100)
     return [PlaylistResponse(**playlist) for playlist in playlists]
 
+@api_router.get("/playlists/{playlist_id}", response_model=PlaylistResponse)
+async def get_playlist(playlist_id: str, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+
+    playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    if playlist["user_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    return PlaylistResponse(**playlist)
+
+@api_router.put("/playlists/{playlist_id}", response_model=PlaylistResponse)
+async def update_playlist(playlist_id: str, payload: PlaylistUpdate, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+
+    playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    if playlist["user_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not update_data:
+        return PlaylistResponse(**playlist)
+
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.playlists.update_one({"playlist_id": playlist_id}, {"$set": update_data})
+
+    updated = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
+    return PlaylistResponse(**updated)
+
 @api_router.put("/playlists/{playlist_id}/tracks")
 async def update_playlist_tracks(playlist_id: str, track_ids: List[str], authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
@@ -908,6 +1089,49 @@ async def update_playlist_tracks(playlist_id: str, track_ids: List[str], authori
     )
     
     return {"message": "Playlist updated"}
+
+class PlaylistTrackAdd(BaseModel):
+    track_id: str
+
+@api_router.post("/playlists/{playlist_id}/tracks")
+async def add_track_to_playlist(playlist_id: str, payload: PlaylistTrackAdd, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+
+    playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    if playlist["user_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    track_id = payload.track_id
+    exists = await db.tracks.find_one({"track_id": track_id}, {"_id": 1})
+    if not exists:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    if track_id in (playlist.get("track_ids") or []):
+        return {"message": "Already in playlist"}
+
+    await db.playlists.update_one(
+        {"playlist_id": playlist_id},
+        {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}, "$push": {"track_ids": track_id}},
+    )
+    return {"message": "Added"}
+
+@api_router.delete("/playlists/{playlist_id}/tracks/{track_id}")
+async def remove_track_from_playlist(playlist_id: str, track_id: str, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+
+    playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    if playlist["user_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    await db.playlists.update_one(
+        {"playlist_id": playlist_id},
+        {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}, "$pull": {"track_ids": track_id}},
+    )
+    return {"message": "Removed"}
 
 @api_router.delete("/playlists/{playlist_id}")
 async def delete_playlist(playlist_id: str, authorization: Optional[str] = Header(None), request: Request = None):
@@ -948,13 +1172,12 @@ async def add_like(like_data: LikeRequest, authorization: Optional[str] = Header
     })
     
     # Update likes count
-    collection = db.tracks if like_data.item_type == "track" else db.albums
-    id_field = "track_id" if like_data.item_type == "track" else "album_id"
-    
-    await collection.update_one(
-        {id_field: like_data.item_id},
-        {"$inc": {"likes_count": 1}}
-    )
+    if like_data.item_type == "track":
+        await db.tracks.update_one({"track_id": like_data.item_id}, {"$inc": {"likes_count": 1}})
+    elif like_data.item_type == "album":
+        await db.albums.update_one({"album_id": like_data.item_id}, {"$inc": {"likes_count": 1}})
+    else:
+        await db.users.update_one({"user_id": like_data.item_id, "role": "artist"}, {"$inc": {"likes_count": 1}})
     
     return {"message": "Liked"}
 
@@ -970,13 +1193,12 @@ async def remove_like(item_type: str, item_id: str, authorization: Optional[str]
     
     if result.deleted_count > 0:
         # Update likes count
-        collection = db.tracks if item_type == "track" else db.albums
-        id_field = "track_id" if item_type == "track" else "album_id"
-        
-        await collection.update_one(
-            {id_field: item_id},
-            {"$inc": {"likes_count": -1}}
-        )
+        if item_type == "track":
+            await db.tracks.update_one({"track_id": item_id}, {"$inc": {"likes_count": -1}})
+        elif item_type == "album":
+            await db.albums.update_one({"album_id": item_id}, {"$inc": {"likes_count": -1}})
+        else:
+            await db.users.update_one({"user_id": item_id, "role": "artist"}, {"$inc": {"likes_count": -1}})
     
     return {"message": "Unliked"}
 
@@ -986,13 +1208,54 @@ async def get_likes(authorization: Optional[str] = Header(None), request: Reques
     likes = await db.likes.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(1000)
     return likes
 
+@api_router.get("/likes/state")
+async def get_likes_state(item_type: str, ids: str, authorization: Optional[str] = Header(None), request: Request = None):
+    """Return a map {id: boolean} for the given item_type and comma-separated ids."""
+    user = await get_current_user(authorization, request)
+
+    id_list = [i.strip() for i in (ids or "").split(",") if i.strip()]
+    if not id_list:
+        return {}
+
+    cursor = db.likes.find(
+        {"user_id": user["user_id"], "item_type": item_type, "item_id": {"$in": id_list}},
+        {"_id": 0, "item_id": 1},
+    )
+    liked_docs = await cursor.to_list(len(id_list))
+    liked_set = {d["item_id"] for d in liked_docs}
+    return {i: (i in liked_set) for i in id_list}
+
+@api_router.get("/likes/summary")
+async def get_likes_summary(limit: int = 200, authorization: Optional[str] = Header(None), request: Request = None):
+    """Return expanded liked items grouped by type."""
+    user = await get_current_user(authorization, request)
+    likes = await db.likes.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(5000)
+
+    track_ids = [l["item_id"] for l in likes if l["item_type"] == "track"][:limit]
+    album_ids = [l["item_id"] for l in likes if l["item_type"] == "album"][:limit]
+    artist_ids = [l["item_id"] for l in likes if l["item_type"] == "artist"][:limit]
+
+    tracks = await db.tracks.find({"track_id": {"$in": track_ids}}, {"_id": 0}).to_list(len(track_ids))
+    albums = await db.albums.find({"album_id": {"$in": album_ids}}, {"_id": 0}).to_list(len(album_ids))
+    artists = await db.users.find({"user_id": {"$in": artist_ids}, "role": "artist"}, {"_id": 0, "password_hash": 0}).to_list(len(artist_ids))
+
+    # preserve order roughly by ids list
+    track_by_id = {t["track_id"]: t for t in tracks}
+    album_by_id = {a["album_id"]: a for a in albums}
+    artist_by_id = {a["user_id"]: a for a in artists}
+
+    return {
+        "tracks": [track_by_id[i] for i in track_ids if i in track_by_id],
+        "albums": [album_by_id[i] for i in album_ids if i in album_by_id],
+        "artists": [artist_by_id[i] for i in artist_ids if i in artist_by_id],
+    }
+
 # ==================== PURCHASE ROUTES ====================
 
 @api_router.post("/purchases/checkout")
 async def create_checkout(checkout_data: CheckoutRequest, authorization: Optional[str] = Header(None), request: Request = None):
-    ensure_stripe_available()
     user = await get_current_user(authorization, request)
-    
+
     # Get item details
     if checkout_data.item_type == "track":
         item = await db.tracks.find_one({"track_id": checkout_data.item_id}, {"_id": 0})
@@ -1002,17 +1265,25 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
         item = await db.albums.find_one({"album_id": checkout_data.item_id}, {"_id": 0})
         if not item:
             raise HTTPException(status_code=404, detail="Album not found")
-    
+
+    if is_free_item_price(item.get("price")):
+        raise HTTPException(
+            status_code=400,
+            detail="Les contenus gratuits s'ajoutent à la bibliothèque sans passer par le paiement.",
+        )
+
+    ensure_stripe_available()
+
     # Check if already purchased
     existing_purchase = await db.purchases.find_one({
         "user_id": user["user_id"],
         "item_type": checkout_data.item_type,
         "item_id": checkout_data.item_id
     })
-    
+
     if existing_purchase:
         raise HTTPException(status_code=400, detail="Already purchased")
-    
+
     # Create Stripe checkout session
     host_url = checkout_data.origin_url
     webhook_url = f"{str(request.base_url).rstrip('/')}/api/webhook/stripe"
@@ -1111,6 +1382,45 @@ async def get_checkout_status(session_id: str, authorization: Optional[str] = He
         "currency": checkout_status.currency
     }
 
+@api_router.post("/purchases/library")
+async def add_to_library(payload: AddToLibraryRequest, authorization: Optional[str] = Header(None), request: Request = None):
+    """Ajoute un titre ou album gratuit à la bibliothèque (sans Stripe)."""
+    user = await get_current_user(authorization, request)
+
+    if payload.item_type == "track":
+        item = await db.tracks.find_one({"track_id": payload.item_id}, {"_id": 0})
+        if not item:
+            raise HTTPException(status_code=404, detail="Track not found")
+    else:
+        item = await db.albums.find_one({"album_id": payload.item_id}, {"_id": 0})
+        if not item:
+            raise HTTPException(status_code=404, detail="Album not found")
+
+    if not is_free_item_price(item.get("price")):
+        raise HTTPException(
+            status_code=400,
+            detail="Ce contenu est payant : utilisez le checkout.",
+        )
+
+    existing = await db.purchases.find_one({
+        "user_id": user["user_id"],
+        "item_type": payload.item_type,
+        "item_id": payload.item_id,
+    })
+    if existing:
+        return {"message": "Déjà dans la bibliothèque", "purchase_id": existing.get("purchase_id")}
+
+    purchase_doc = {
+        "purchase_id": f"purchase_{uuid.uuid4().hex[:12]}",
+        "user_id": user["user_id"],
+        "item_type": payload.item_type,
+        "item_id": payload.item_id,
+        "price_paid": 0,
+        "purchased_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.purchases.insert_one(purchase_doc)
+    return {"message": "Ajouté à la bibliothèque", "purchase_id": purchase_doc["purchase_id"]}
+
 @api_router.get("/purchases/library")
 async def get_library(authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
@@ -1131,6 +1441,57 @@ async def get_library(authorization: Optional[str] = Header(None), request: Requ
                 library["albums"].append(album)
     
     return library
+
+# ==================== FOLLOW ROUTES ====================
+
+@api_router.post("/follows")
+async def follow_artist(payload: FollowRequest, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    artist_id = payload.artist_id
+
+    artist = await db.users.find_one({"user_id": artist_id, "role": "artist"}, {"_id": 1})
+    if not artist:
+        raise HTTPException(status_code=404, detail="Artist not found")
+
+    existing = await db.follows.find_one({"user_id": user["user_id"], "artist_id": artist_id})
+    if existing:
+        return {"message": "Already following"}
+
+    await db.follows.insert_one({
+        "user_id": user["user_id"],
+        "artist_id": artist_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    await db.users.update_one({"user_id": artist_id, "role": "artist"}, {"$inc": {"followers_count": 1}})
+    return {"message": "Following"}
+
+@api_router.delete("/follows")
+async def unfollow_artist(artist_id: str, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    result = await db.follows.delete_one({"user_id": user["user_id"], "artist_id": artist_id})
+    if result.deleted_count:
+        await db.users.update_one({"user_id": artist_id, "role": "artist"}, {"$inc": {"followers_count": -1}})
+    return {"message": "Unfollowed"}
+
+@api_router.get("/follows")
+async def get_my_follows(limit: int = 200, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    follows = await db.follows.find({"user_id": user["user_id"]}, {"_id": 0}).limit(limit).to_list(limit)
+    artist_ids = [f["artist_id"] for f in follows]
+    artists = await db.users.find({"user_id": {"$in": artist_ids}, "role": "artist"}, {"_id": 0, "password_hash": 0}).to_list(len(artist_ids))
+    by_id = {a["user_id"]: a for a in artists}
+    return [by_id[i] for i in artist_ids if i in by_id]
+
+@api_router.get("/follows/state")
+async def get_follow_state(artist_ids: str, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    ids_list = [i.strip() for i in (artist_ids or "").split(",") if i.strip()]
+    if not ids_list:
+        return {}
+    docs = await db.follows.find({"user_id": user["user_id"], "artist_id": {"$in": ids_list}}, {"_id": 0, "artist_id": 1}).to_list(len(ids_list))
+    followed = {d["artist_id"] for d in docs}
+    return {i: (i in followed) for i in ids_list}
 
 # ==================== WEBHOOK ROUTES ====================
 
@@ -1336,6 +1697,43 @@ async def record_play(track_id: str, duration_sec: int = 15, authorization: Opti
     
     await db.plays.insert_one(play_doc)
     return {"status": "recorded"}
+
+# ==================== SEARCH ROUTES ====================
+
+@api_router.get("/search")
+async def search(q: str, types: str = "tracks,albums,artists", limit: int = 20):
+    """Simple search across published tracks, albums, and artists."""
+    query = (q or "").strip()
+    if not query:
+        return {"tracks": [], "albums": [], "artists": []}
+
+    type_set = {t.strip().lower() for t in types.split(",") if t.strip()}
+    regex = {"$regex": query, "$options": "i"}
+
+    results = {"tracks": [], "albums": [], "artists": []}
+
+    if "tracks" in type_set:
+        tracks = await db.tracks.find(
+            {"status": "published", "$or": [{"title": regex}, {"artist_name": regex}, {"genre": regex}]},
+            {"_id": 0},
+        ).limit(limit).to_list(limit)
+        results["tracks"] = tracks
+
+    if "albums" in type_set:
+        albums = await db.albums.find(
+            {"$or": [{"title": regex}, {"artist_name": regex}]},
+            {"_id": 0},
+        ).limit(limit).to_list(limit)
+        results["albums"] = albums
+
+    if "artists" in type_set:
+        artists = await db.users.find(
+            {"role": "artist", "$or": [{"name": regex}, {"artist_name": regex}]},
+            {"_id": 0, "password_hash": 0},
+        ).limit(limit).to_list(limit)
+        results["artists"] = artists
+
+    return results
 
 # Include router
 app.include_router(api_router)

@@ -29,7 +29,14 @@ import shutil
 from urllib.parse import urlencode
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+# Load `.env.{APP_ENV}` then optional `.env` (local overrides). Railway/Render inject vars directly.
+_app_env = os.getenv("APP_ENV", "development").lower().strip()
+_primary = ROOT_DIR / f".env.{_app_env}"
+if _primary.exists():
+    load_dotenv(_primary)
+_legacy = ROOT_DIR / ".env"
+if _legacy.exists():
+    load_dotenv(_legacy, override=True)
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']

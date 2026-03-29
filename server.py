@@ -1742,6 +1742,11 @@ async def search(q: str, types: str = "tracks,albums,artists", limit: int = 20):
 
     return results
 
+@app.get("/health")
+async def health_check():
+    """Ping public (prod / navigateur), sans JWT."""
+    return {"status": "ok"}
+
 # Include router
 app.include_router(api_router)
 

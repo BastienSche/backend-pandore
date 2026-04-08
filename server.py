@@ -121,6 +121,8 @@ class GoogleSessionResponse(BaseModel):
 class TrackCreate(BaseModel):
     title: str
     price: float  # Prix en cents
+    is_free_price: bool = False
+    min_price: Optional[float] = None  # Minimum en cents (si prix libre)
     genre: str
     description: Optional[str] = None
     album_id: Optional[str] = None
@@ -137,6 +139,8 @@ class TrackResponse(BaseModel):
     artist_name: str
     album_id: Optional[str]
     price: float
+    is_free_price: bool = False
+    min_price: Optional[float] = None
     duration: Optional[int]
     preview_url: str
     preview_start_time: int
@@ -153,6 +157,8 @@ class TrackResponse(BaseModel):
 class AlbumCreate(BaseModel):
     title: str
     price: float  # Prix en cents
+    is_free_price: bool = False
+    min_price: Optional[float] = None  # Minimum en cents (si prix libre)
     description: Optional[str] = None
     status: str = "draft"  # draft|published
 
@@ -162,6 +168,8 @@ class AlbumResponse(BaseModel):
     artist_id: str
     artist_name: str
     price: float
+    is_free_price: bool = False
+    min_price: Optional[float] = None
     cover_url: Optional[str]
     description: Optional[str]
     track_ids: List[str]
@@ -172,6 +180,8 @@ class AlbumResponse(BaseModel):
 class AlbumTrackCreate(BaseModel):
     title: str
     price: float  # Prix en cents
+    is_free_price: bool = False
+    min_price: Optional[float] = None  # Minimum en cents (si prix libre)
     genre: str
     description: Optional[str] = None
     preview_start_time: int = 0
@@ -187,6 +197,8 @@ class AlbumTrackResponse(BaseModel):
     artist_id: str
     artist_name: str
     price: float
+    is_free_price: bool = False
+    min_price: Optional[float] = None
     duration: Optional[int]
     preview_url: str
     preview_start_time: int
@@ -244,6 +256,7 @@ class CheckoutRequest(BaseModel):
     item_type: Literal["track", "album"]
     item_id: str
     origin_url: str
+    amount_cents: Optional[float] = None  # Utilisé uniquement si prix libre
 
 class AddToLibraryRequest(BaseModel):
     item_type: Literal["track", "album"]
@@ -798,6 +811,8 @@ async def create_track(track_data: TrackCreate, authorization: Optional[str] = H
         "artist_name": user["artist_name"],
         "album_id": track_data.album_id,
         "price": track_data.price,
+        "is_free_price": bool(track_data.is_free_price),
+        "min_price": track_data.min_price if track_data.is_free_price else None,
         "duration": track_data.duration_sec,
         "preview_url": "",
         "preview_start_time": track_data.preview_start_time,
@@ -891,6 +906,8 @@ async def create_album(album_data: AlbumCreate, authorization: Optional[str] = H
         "artist_id": user["user_id"],
         "artist_name": user["artist_name"],
         "price": album_data.price,
+        "is_free_price": bool(album_data.is_free_price),
+        "min_price": album_data.min_price if album_data.is_free_price else None,
         "cover_url": None,
         "description": album_data.description,
         "track_ids": [],
@@ -950,6 +967,8 @@ async def create_album_track(album_id: str, track_data: AlbumTrackCreate, author
         "artist_name": user["artist_name"],
         "album_id": album_id,
         "price": track_data.price,
+        "is_free_price": bool(track_data.is_free_price),
+        "min_price": track_data.min_price if track_data.is_free_price else None,
         "duration": track_data.duration_sec,
         "preview_url": "",
         "preview_start_time": track_data.preview_start_time,
@@ -1273,11 +1292,30 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
         if not item:
             raise HTTPException(status_code=404, detail="Album not found")
 
-    if is_free_item_price(item.get("price")):
-        raise HTTPException(
-            status_code=400,
-            detail="Les contenus gratuits s'ajoutent à la bibliothèque sans passer par le paiement.",
-        )
+    is_pay_what_you_want = bool(item.get("is_free_price"))
+    if is_pay_what_you_want:
+        if checkout_data.amount_cents is None:
+            raise HTTPException(status_code=400, detail="amount_cents requis pour un prix libre")
+        try:
+            amount_cents = float(checkout_data.amount_cents)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="amount_cents invalide")
+        if amount_cents <= 0:
+            raise HTTPException(status_code=400, detail="amount_cents doit être > 0 (utilise /purchases/library pour 0€)")
+        min_price = item.get("min_price")
+        if min_price is not None:
+            try:
+                min_cents = float(min_price)
+            except (TypeError, ValueError):
+                min_cents = None
+            if min_cents is not None and amount_cents < min_cents:
+                raise HTTPException(status_code=400, detail=f"Minimum: {min_cents} cents")
+    else:
+        if is_free_item_price(item.get("price")):
+            raise HTTPException(
+                status_code=400,
+                detail="Les contenus gratuits s'ajoutent à la bibliothèque sans passer par le paiement.",
+            )
 
     ensure_stripe_available()
 
@@ -1300,7 +1338,7 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
     cancel_url = f"{host_url}/browse"
     
     checkout_request = CheckoutSessionRequest(
-        amount=float(item["price"]),
+        amount=float(amount_cents if is_pay_what_you_want else item["price"]),
         currency="usd",
         success_url=success_url,
         cancel_url=cancel_url,
@@ -1318,7 +1356,7 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
         "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
         "session_id": session.session_id,
         "user_id": user["user_id"],
-        "amount": float(item["price"]),
+        "amount": float(amount_cents if is_pay_what_you_want else item["price"]),
         "currency": "usd",
         "status": "pending",
         "payment_status": "pending",
@@ -1403,11 +1441,21 @@ async def add_to_library(payload: AddToLibraryRequest, authorization: Optional[s
         if not item:
             raise HTTPException(status_code=404, detail="Album not found")
 
-    if not is_free_item_price(item.get("price")):
-        raise HTTPException(
-            status_code=400,
-            detail="Ce contenu est payant : utilisez le checkout.",
-        )
+    if bool(item.get("is_free_price")):
+        min_price = item.get("min_price")
+        if min_price is not None:
+            try:
+                min_cents = float(min_price)
+            except (TypeError, ValueError):
+                min_cents = None
+            if min_cents is not None and min_cents > 0:
+                raise HTTPException(status_code=400, detail="Ce prix libre a un minimum : utilisez le checkout.")
+    else:
+        if not is_free_item_price(item.get("price")):
+            raise HTTPException(
+                status_code=400,
+                detail="Ce contenu est payant : utilisez le checkout.",
+            )
 
     existing = await db.purchases.find_one({
         "user_id": user["user_id"],

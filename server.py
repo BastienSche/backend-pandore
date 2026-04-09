@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Request, Header, Response
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Request, Header, Response, Query
 from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -66,6 +66,19 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 logger = logging.getLogger(__name__)
+
+
+def purchase_amount_cents(p: dict) -> float:
+    """Montant en centimes (achats Stripe : price_paid ; ancien champ : amount)."""
+    for key in ("amount", "price_paid"):
+        v = p.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
 
 # ==================== PUBLIC ROUTES ====================
 
@@ -180,6 +193,7 @@ class TrackResponse(BaseModel):
     splits: Optional[List[dict]]
     status: str
     likes_count: int
+    play_count: int = 0
     created_at: str
 
 class AlbumCreate(BaseModel):
@@ -203,6 +217,7 @@ class AlbumResponse(BaseModel):
     track_ids: List[str]
     status: str
     likes_count: int
+    play_count: int = 0
     created_at: str
 
 class AlbumTrackCreate(BaseModel):
@@ -238,6 +253,7 @@ class AlbumTrackResponse(BaseModel):
     splits: Optional[List[dict]]
     status: str
     likes_count: int
+    play_count: int = 0
     created_at: str
 
 class PlaylistCreate(BaseModel):
@@ -853,6 +869,7 @@ async def create_track(track_data: TrackCreate, authorization: Optional[str] = H
         "splits": track_data.splits or [],
         "status": track_data.status,
         "likes_count": 0,
+        "play_count": 0,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
@@ -1630,99 +1647,148 @@ async def stripe_webhook(request: Request):
 
 @api_router.get("/artist/stats")
 async def get_artist_stats(authorization: Optional[str] = Header(None), request: Request = None):
-    """Get comprehensive stats for an artist"""
+    """Get comprehensive stats for an artist (écoutes, ventes payantes, ajouts biblio, likes)."""
     user = await get_current_user(authorization, request)
-    
+
     if user["role"] != "artist":
         raise HTTPException(status_code=403, detail="Only artists can view stats")
-    
+
     artist_id = user["user_id"]
-    
-    # Get all artist's tracks
+
     tracks = await db.tracks.find({"artist_id": artist_id}, {"_id": 0}).to_list(1000)
-    
-    # Get all purchases for artist's tracks
+    albums = await db.albums.find({"artist_id": artist_id}, {"_id": 0}).to_list(500)
     track_ids = [t["track_id"] for t in tracks]
-    purchases = await db.purchases.find({"item_id": {"$in": track_ids}}, {"_id": 0}).to_list(10000)
-    
-    # Get play counts (from a plays collection if exists, otherwise simulate)
-    plays_collection = await db.plays.find({"track_id": {"$in": track_ids}}, {"_id": 0}).to_list(100000)
-    
-    # Calculate stats
+    album_ids = [a["album_id"] for a in albums]
+
+    purchase_conds = []
+    if track_ids:
+        purchase_conds.append({"item_type": "track", "item_id": {"$in": track_ids}})
+    if album_ids:
+        purchase_conds.append({"item_type": "album", "item_id": {"$in": album_ids}})
+    purchases: List[dict] = []
+    if purchase_conds:
+        purchases = await db.purchases.find({"$or": purchase_conds}, {"_id": 0}).to_list(10000)
+
+    plays_collection: List[dict] = []
+    if track_ids:
+        plays_collection = await db.plays.find({"track_id": {"$in": track_ids}}, {"_id": 0}).to_list(100000)
+
     total_tracks = len(tracks)
     published_tracks = len([t for t in tracks if t.get("status") == "published"])
     draft_tracks = total_tracks - published_tracks
-    
-    total_sales = len(purchases)
-    total_revenue = sum(p.get("amount", 0) for p in purchases)
-    
-    # Calculate per-track stats
+
+    paid_purchases = [p for p in purchases if purchase_amount_cents(p) > 0]
+    library_purchases = [p for p in purchases if purchase_amount_cents(p) == 0]
+    total_sales = len(paid_purchases)
+    total_library_adds = len(library_purchases)
+    total_revenue = sum(purchase_amount_cents(p) for p in paid_purchases)
+    total_likes_tracks = sum(int(t.get("likes_count") or 0) for t in tracks)
+    total_likes_albums = sum(int(a.get("likes_count") or 0) for a in albums)
+
     track_stats = []
     for track in tracks:
-        track_purchases = [p for p in purchases if p["item_id"] == track["track_id"]]
-        track_plays = [p for p in plays_collection if p.get("track_id") == track["track_id"]]
-        
+        tid = track["track_id"]
+        t_purchases = [p for p in purchases if p.get("item_type") == "track" and p["item_id"] == tid]
+        paid_tp = [p for p in t_purchases if purchase_amount_cents(p) > 0]
+        free_tp = [p for p in t_purchases if purchase_amount_cents(p) == 0]
+        track_plays = [p for p in plays_collection if p.get("track_id") == tid]
+        play_n = max(len(track_plays), int(track.get("play_count") or 0))
         track_stats.append({
-            "track_id": track["track_id"],
+            "track_id": tid,
             "title": track["title"],
             "cover_url": track.get("cover_url"),
             "genre": track.get("genre"),
             "price": track.get("price", 0),
             "status": track.get("status", "draft"),
-            "sales_count": len(track_purchases),
-            "revenue": sum(p.get("amount", 0) for p in track_purchases),
-            "play_count": len(track_plays),
+            "sales_count": len(paid_tp),
+            "library_adds_count": len(free_tp),
+            "revenue": sum(purchase_amount_cents(p) for p in paid_tp),
+            "play_count": play_n,
             "play_duration_sec": sum(p.get("duration_sec", 15) for p in track_plays),
-            "likes_count": track.get("likes_count", 0),
-            "created_at": track.get("created_at")
+            "likes_count": int(track.get("likes_count") or 0),
+            "created_at": track.get("created_at"),
         })
-    
-    # Sort by revenue
-    track_stats.sort(key=lambda x: x["revenue"], reverse=True)
-    
-    # Calculate time-based stats (last 7 days, 30 days)
-    from datetime import timedelta
+
+    track_stats.sort(key=lambda x: x["play_count"], reverse=True)
+    top_tracks = track_stats[:5]
+
+    album_stats = []
+    for album in albums:
+        aid = album["album_id"]
+        a_purchases = [p for p in purchases if p.get("item_type") == "album" and p["item_id"] == aid]
+        paid_ap = [p for p in a_purchases if purchase_amount_cents(p) > 0]
+        free_ap = [p for p in a_purchases if purchase_amount_cents(p) == 0]
+        tr_in_album = [t for t in tracks if t.get("album_id") == aid]
+        play_sum = 0
+        for t in tr_in_album:
+            play_sum += len([p for p in plays_collection if p.get("track_id") == t["track_id"]])
+        album_stats.append({
+            "album_id": aid,
+            "title": album["title"],
+            "cover_url": album.get("cover_url"),
+            "sales_count": len(paid_ap),
+            "library_adds_count": len(free_ap),
+            "revenue": sum(purchase_amount_cents(p) for p in paid_ap),
+            "play_count": play_sum,
+            "likes_count": int(album.get("likes_count") or 0),
+            "status": album.get("status", "draft"),
+            "created_at": album.get("created_at"),
+        })
+
     now = datetime.now(timezone.utc)
     week_ago = now - timedelta(days=7)
     month_ago = now - timedelta(days=30)
-    
+
     def parse_date(date_str):
         if not date_str:
             return None
         try:
-            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-        except:
+            return datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+        except Exception:
             return None
-    
-    recent_purchases = [p for p in purchases if parse_date(p.get("purchased_at")) and parse_date(p.get("purchased_at")) > week_ago]
-    monthly_purchases = [p for p in purchases if parse_date(p.get("purchased_at")) and parse_date(p.get("purchased_at")) > month_ago]
-    
-    # Total play time
+
+    recent_purchases = [
+        p for p in purchases
+        if parse_date(p.get("purchased_at")) and parse_date(p.get("purchased_at")) > week_ago
+    ]
+    monthly_purchases = [
+        p for p in purchases
+        if parse_date(p.get("purchased_at")) and parse_date(p.get("purchased_at")) > month_ago
+    ]
+    recent_paid = [p for p in recent_purchases if purchase_amount_cents(p) > 0]
+    monthly_paid = [p for p in monthly_purchases if purchase_amount_cents(p) > 0]
+
     total_play_duration = sum(p.get("duration_sec", 15) for p in plays_collection)
-    
+
     return {
         "overview": {
             "total_tracks": total_tracks,
             "published_tracks": published_tracks,
             "draft_tracks": draft_tracks,
             "total_sales": total_sales,
+            "total_library_adds": total_library_adds,
             "total_revenue": total_revenue,
             "total_play_count": len(plays_collection),
             "total_play_duration_sec": total_play_duration,
-            "total_play_duration_hours": round(total_play_duration / 3600, 1)
+            "total_play_duration_hours": round(total_play_duration / 3600, 1),
+            "total_likes_tracks": total_likes_tracks,
+            "total_likes_albums": total_likes_albums,
         },
         "period_stats": {
             "last_7_days": {
-                "sales": len(recent_purchases),
-                "revenue": sum(p.get("amount", 0) for p in recent_purchases)
+                "sales": len(recent_paid),
+                "library_adds": len([p for p in recent_purchases if purchase_amount_cents(p) == 0]),
+                "revenue": sum(purchase_amount_cents(p) for p in recent_paid),
             },
             "last_30_days": {
-                "sales": len(monthly_purchases),
-                "revenue": sum(p.get("amount", 0) for p in monthly_purchases)
-            }
+                "sales": len(monthly_paid),
+                "library_adds": len([p for p in monthly_purchases if purchase_amount_cents(p) == 0]),
+                "revenue": sum(purchase_amount_cents(p) for p in monthly_paid),
+            },
         },
         "track_stats": track_stats,
-        "top_tracks": track_stats[:5]
+        "album_stats": album_stats,
+        "top_tracks": top_tracks,
     }
 
 @api_router.get("/artist/tracks")
@@ -1761,24 +1827,33 @@ async def publish_track(track_id: str, authorization: Optional[str] = Header(Non
     return {"status": new_status, "message": f"Track {'published' if new_status == 'published' else 'unpublished'} successfully"}
 
 @api_router.post("/plays")
-async def record_play(track_id: str, duration_sec: int = 15, authorization: Optional[str] = Header(None), request: Request = None):
-    """Record a track play for analytics"""
+async def record_play(
+    request: Request,
+    track_id: str = Query(..., min_length=3),
+    duration_sec: int = Query(15, ge=1, le=7200),
+    authorization: Optional[str] = Header(None),
+):
+    """Enregistre une écoute (aperçu ou morceau complet) pour les stats artiste."""
+    track = await db.tracks.find_one({"track_id": track_id}, {"_id": 0, "track_id": 1})
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
     play_doc = {
         "play_id": f"play_{uuid.uuid4().hex[:12]}",
         "track_id": track_id,
         "duration_sec": duration_sec,
         "played_at": datetime.now(timezone.utc).isoformat(),
-        "user_id": None
+        "user_id": None,
     }
-    
-    # Try to get user if authenticated
+
     try:
         user = await get_current_user(authorization, request)
         play_doc["user_id"] = user["user_id"]
-    except:
+    except Exception:
         pass
-    
+
     await db.plays.insert_one(play_doc)
+    await db.tracks.update_one({"track_id": track_id}, {"$inc": {"play_count": 1}})
     return {"status": "recorded"}
 
 # ==================== SEARCH ROUTES ====================

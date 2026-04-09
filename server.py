@@ -67,6 +67,34 @@ api_router = APIRouter(prefix="/api")
 
 logger = logging.getLogger(__name__)
 
+# ==================== PUBLIC ROUTES ====================
+
+@api_router.get("/public/stats")
+async def get_public_stats():
+    """
+    Public, no-auth stats for homepage.
+    Returns total users, total artists, total published tracks.
+    """
+    try:
+        users_count = await db.users.count_documents({})
+    except Exception:
+        users_count = 0
+    try:
+        artists_count = await db.users.count_documents({"role": "artist"})
+    except Exception:
+        artists_count = 0
+    try:
+        tracks_count = await db.tracks.count_documents({"status": "published"})
+    except Exception:
+        # backward compat (some envs may not have status)
+        tracks_count = await db.tracks.count_documents({})
+
+    return {
+        "users_count": int(users_count or 0),
+        "artists_count": int(artists_count or 0),
+        "tracks_count": int(tracks_count or 0),
+    }
+
 def ensure_stripe_available():
     if StripeCheckout is None:
         raise HTTPException(

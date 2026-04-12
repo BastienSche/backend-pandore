@@ -7,26 +7,32 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
-from typing import List, Optional, Literal
+from typing import Any, List, Optional, Literal
 import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
-try:
-    from emergentintegrations.payments.stripe.checkout import (
-        StripeCheckout,
-        CheckoutSessionResponse,
-        CheckoutStatusResponse,
-        CheckoutSessionRequest,
-    )
-except ImportError:
-    StripeCheckout = None
-    CheckoutSessionResponse = None
-    CheckoutStatusResponse = None
-    CheckoutSessionRequest = None
 import aiofiles
 import shutil
+import asyncio
 from urllib.parse import urlencode
+
+import stripe
+from stripe_payments import (
+    compute_platform_fee_cents,
+    create_account_login_link,
+    create_account_onboarding_link,
+    create_checkout_session,
+    create_express_connected_account,
+    get_platform_fee_percent,
+    parse_thin_event_notification,
+    retrieve_checkout_session,
+    retrieve_connect_account,
+    retrieve_connect_balance,
+    construct_webhook_event,
+    stripe_configured,
+    stripe_connect_enabled,
+)
 
 ROOT_DIR = Path(__file__).parent
 # Load `.env.{APP_ENV}` then optional `.env` (local overrides). Railway/Render inject vars directly.
@@ -49,6 +55,7 @@ JWT_ALGORITHM = os.environ.get('JWT_ALGORITHM', 'HS256')
 
 # Stripe Configuration
 STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY')
+STRIPE_CURRENCY_ENV = os.environ.get('STRIPE_CURRENCY', 'eur').lower()
 
 # Google OAuth Configuration
 GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
@@ -80,6 +87,17 @@ def purchase_amount_cents(p: dict) -> float:
     return 0.0
 
 
+def purchase_seller_net_cents(p: dict) -> float:
+    """Part vendeur après commission plateforme (Connect). Sinon fallback sur le prix payé (legacy)."""
+    v = p.get("seller_net_cents")
+    if v is not None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    return purchase_amount_cents(p)
+
+
 # ==================== PUBLIC ROUTES ====================
 
 @api_router.get("/public/stats")
@@ -109,10 +127,13 @@ async def get_public_stats():
     }
 
 def ensure_stripe_available():
-    if StripeCheckout is None:
+    if not stripe_configured():
         raise HTTPException(
             status_code=503,
-            detail="Stripe integration unavailable. Install emergentintegrations to enable payments.",
+            detail=(
+                "Stripe non configuré : définir STRIPE_API_KEY sur le serveur "
+                "(Dashboard Stripe → Developers → API keys → Secret key)."
+            ),
         )
 
 def is_free_item_price(price) -> bool:
@@ -298,13 +319,13 @@ class ArtistProfileResponse(BaseModel):
 
 class CheckoutRequest(BaseModel):
     item_type: Literal["track", "album"]
-    item_id: str
+    item_id: str = Field(..., min_length=1)
     origin_url: str
     amount_cents: Optional[float] = None  # Utilisé uniquement si prix libre
 
 class AddToLibraryRequest(BaseModel):
     item_type: Literal["track", "album"]
-    item_id: str
+    item_id: str = Field(..., min_length=1)
 
 class FollowRequest(BaseModel):
     artist_id: str
@@ -1326,16 +1347,29 @@ async def get_likes_summary(limit: int = 200, authorization: Optional[str] = Hea
 @api_router.post("/purchases/checkout")
 async def create_checkout(checkout_data: CheckoutRequest, authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
+    item_id = checkout_data.item_id.strip()
+    if not item_id:
+        raise HTTPException(status_code=400, detail="item_id invalide")
 
     # Get item details
     if checkout_data.item_type == "track":
-        item = await db.tracks.find_one({"track_id": checkout_data.item_id}, {"_id": 0})
+        item = await db.tracks.find_one({"track_id": item_id}, {"_id": 0})
         if not item:
             raise HTTPException(status_code=404, detail="Track not found")
     else:
-        item = await db.albums.find_one({"album_id": checkout_data.item_id}, {"_id": 0})
+        item = await db.albums.find_one({"album_id": item_id}, {"_id": 0})
         if not item:
             raise HTTPException(status_code=404, detail="Album not found")
+
+    artist_id = item.get("artist_id")
+    if not artist_id:
+        raise HTTPException(status_code=400, detail="Article sans vendeur (artist_id manquant)")
+    if user["user_id"] == artist_id:
+        raise HTTPException(status_code=400, detail="Tu ne peux pas acheter ton propre contenu")
+
+    seller = await db.users.find_one({"user_id": artist_id, "role": "artist"}, {"_id": 0})
+    if not seller:
+        raise HTTPException(status_code=400, detail="Vendeur introuvable")
 
     is_pay_what_you_want = bool(item.get("is_free_price"))
     if is_pay_what_you_want:
@@ -1364,62 +1398,124 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
 
     ensure_stripe_available()
 
-    # Check if already purchased
+    # Check if already purchased (même item exact — id normalisé)
     existing_purchase = await db.purchases.find_one({
         "user_id": user["user_id"],
         "item_type": checkout_data.item_type,
-        "item_id": checkout_data.item_id
+        "item_id": item_id,
     })
 
     if existing_purchase:
         raise HTTPException(status_code=400, detail="Already purchased")
 
-    # Create Stripe checkout session
-    host_url = checkout_data.origin_url
-    webhook_url = f"{str(request.base_url).rstrip('/')}/api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-    
-    success_url = f"{host_url}/library?session_id={{{{CHECKOUT_SESSION_ID}}}}"
-    cancel_url = f"{host_url}/browse"
-    
-    checkout_request = CheckoutSessionRequest(
-        amount=float(amount_cents if is_pay_what_you_want else item["price"]),
-        currency="usd",
-        success_url=success_url,
-        cancel_url=cancel_url,
-        metadata={
-            "user_id": user["user_id"],
-            "item_type": checkout_data.item_type,
-            "item_id": checkout_data.item_id
-        }
+    if is_pay_what_you_want:
+        amount_total_cents = int(round(amount_cents))
+    else:
+        raw_price = item.get("price")
+        if raw_price is None:
+            raise HTTPException(status_code=400, detail="Prix manquant pour cet article")
+        try:
+            amount_total_cents = int(round(float(raw_price)))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Prix invalide pour cet article")
+
+    product_title = (item.get("title") or "").strip() or (
+        "Album" if checkout_data.item_type == "album" else "Track"
     )
-    
-    session: CheckoutSessionResponse = await stripe_checkout.create_checkout_session(checkout_request)
-    
-    # Create payment transaction record
+
+    connect_account_id = seller.get("stripe_connect_account_id")
+    fee_cents = compute_platform_fee_cents(amount_total_cents)
+    use_connect = (
+        stripe_connect_enabled()
+        and amount_total_cents > 0
+        and bool(connect_account_id)
+    )
+
+    if stripe_connect_enabled() and amount_total_cents > 0:
+        if not connect_account_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Ce vendeur n'a pas encore activé les paiements (Stripe Connect). Réessaie plus tard.",
+            )
+        try:
+            acct = await asyncio.to_thread(retrieve_connect_account, connect_account_id)
+            if not getattr(acct, "charges_enabled", False):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Le vendeur n'a pas terminé l'activation des paiements Stripe.",
+                )
+        except HTTPException:
+            raise
+        except stripe.error.StripeError as e:
+            logger.warning("Stripe Connect account: %s", e, exc_info=True)
+            msg = getattr(e, "user_message", None) or getattr(e, "message", None) or str(e)
+            raise HTTPException(status_code=502, detail=f"Stripe Connect: {msg}")
+
+    try:
+        session_result = await create_checkout_session(
+            amount_cents=amount_total_cents,
+            product_name=product_title,
+            user_id=user["user_id"],
+            item_type=checkout_data.item_type,
+            item_id=item_id,
+            origin_url=checkout_data.origin_url,
+            artist_id=artist_id,
+            connect_account_id=connect_account_id if use_connect else None,
+            platform_fee_cents=fee_cents if use_connect else None,
+        )
+    except stripe.error.StripeError as e:
+        # Clé invalide, réseau, paramètres Stripe, etc. — éviter une 500 sans message.
+        logger.warning("Stripe checkout session: %s", e, exc_info=True)
+        msg = getattr(e, "user_message", None) or getattr(e, "message", None) or str(e)
+        raise HTTPException(status_code=502, detail=f"Stripe: {msg}")
+
+    seller_amount = float(amount_total_cents - fee_cents) if use_connect else float(amount_total_cents)
+
     transaction_doc = {
         "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
-        "session_id": session.session_id,
+        "session_id": session_result["session_id"],
         "user_id": user["user_id"],
-        "amount": float(amount_cents if is_pay_what_you_want else item["price"]),
-        "currency": "usd",
+        "amount": float(amount_total_cents),
+        "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
         "status": "pending",
         "payment_status": "pending",
         "metadata": {
             "item_type": checkout_data.item_type,
-            "item_id": checkout_data.item_id
+            "item_id": item_id,
         },
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "artist_id": artist_id,
+        "stripe_connect_account_id": connect_account_id if use_connect else None,
+        "platform_fee_cents": int(fee_cents) if use_connect else 0,
+        "seller_amount_cents": int(round(seller_amount)) if use_connect else int(amount_total_cents),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    
+
     await db.payment_transactions.insert_one(transaction_doc)
-    
-    return {"url": session.url, "session_id": session.session_id}
+
+    return {"url": session_result["url"], "session_id": session_result["session_id"]}
 
 @api_router.get("/purchases/status/{session_id}")
 async def get_checkout_status(session_id: str, authorization: Optional[str] = Header(None), request: Request = None):
     ensure_stripe_available()
     user = await get_current_user(authorization, request)
+
+    sk = (os.environ.get("STRIPE_API_KEY") or "").strip()
+    if session_id.startswith("cs_test_") and sk.startswith("sk_live_"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Incohérence Stripe : session de test (cs_test_…) mais STRIPE_API_KEY est en live. "
+                "Utilise une clé sk_test_… côté serveur pour le développement, ou refais un paiement en mode live."
+            ),
+        )
+    if session_id.startswith("cs_live_") and sk.startswith("sk_test_"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Incohérence Stripe : session live (cs_live_…) mais STRIPE_API_KEY est en test. "
+                "Mets une clé sk_live_… sur le serveur qui a créé la session, ou repasse un paiement en mode test."
+            ),
+        )
     
     # Get transaction
     transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
@@ -1428,48 +1524,94 @@ async def get_checkout_status(session_id: str, authorization: Optional[str] = He
     
     if transaction["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Check Stripe status
-    host_url = str(request.base_url).rstrip('/')
-    webhook_url = f"{host_url}/api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-    
-    checkout_status: CheckoutStatusResponse = await stripe_checkout.get_checkout_status(session_id)
-    
-    # Update transaction
+
+    try:
+        checkout_status = await retrieve_checkout_session(session_id)
+    except stripe.error.StripeError as e:
+        logger.warning("retrieve_checkout_session %s: %s", session_id, e, exc_info=True)
+        msg = getattr(e, "user_message", None) or getattr(e, "message", None) or str(e)
+        raise HTTPException(status_code=502, detail=f"Stripe: {msg}")
+    except Exception as e:
+        logger.exception("retrieve_checkout_session inattendu %s", session_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Lecture session Stripe impossible: {e!s}",
+        )
+
     await db.payment_transactions.update_one(
         {"session_id": session_id},
-        {"$set": {
-            "status": checkout_status.status,
-            "payment_status": checkout_status.payment_status
-        }}
+        {
+            "$set": {
+                "status": checkout_status.get("status"),
+                "payment_status": checkout_status.get("payment_status"),
+            }
+        },
     )
-    
-    # If paid, create purchase record
-    if checkout_status.payment_status == "paid":
-        # Check if purchase already exists
-        existing_purchase = await db.purchases.find_one({
-            "user_id": transaction["user_id"],
-            "item_type": transaction["metadata"]["item_type"],
-            "item_id": transaction["metadata"]["item_id"]
-        })
-        
+
+    # Métadonnées : Mongo + repli sur la session Stripe (évite KeyError / docs incomplets)
+    md_db = transaction.get("metadata") or {}
+    md_stripe = checkout_status.get("metadata") or {}
+    if not isinstance(md_db, dict):
+        md_db = {}
+    if not isinstance(md_stripe, dict):
+        md_stripe = {}
+    item_type = md_db.get("item_type") or md_stripe.get("item_type")
+    item_id_raw = md_db.get("item_id") or md_stripe.get("item_id")
+    item_id = str(item_id_raw).strip() if item_id_raw is not None else ""
+
+    if checkout_status.get("payment_status") == "paid":
+        if not item_type or not item_id:
+            logger.error(
+                "Session %s payée mais metadata item_type/item_id manquants (db=%s stripe=%s)",
+                session_id,
+                md_db,
+                md_stripe,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Métadonnées d'achat incomplètes (item_type / item_id). "
+                    "Vérifie que le checkout a bien été créé par cette API."
+                ),
+            )
+        existing_purchase = await db.purchases.find_one(
+            {
+                "user_id": transaction["user_id"],
+                "item_type": item_type,
+                "item_id": item_id,
+            }
+        )
         if not existing_purchase:
+            try:
+                amt = transaction.get("amount")
+                price_paid = float(amt) if amt is not None else 0.0
+            except (TypeError, ValueError):
+                price_paid = 0.0
             purchase_doc = {
                 "purchase_id": f"purchase_{uuid.uuid4().hex[:12]}",
                 "user_id": transaction["user_id"],
-                "item_type": transaction["metadata"]["item_type"],
-                "item_id": transaction["metadata"]["item_id"],
-                "price_paid": transaction["amount"],
-                "purchased_at": datetime.now(timezone.utc).isoformat()
+                "item_type": item_type,
+                "item_id": item_id,
+                "price_paid": price_paid,
+                "purchased_at": datetime.now(timezone.utc).isoformat(),
+                "artist_id": transaction.get("artist_id") or md_stripe.get("artist_id"),
+                "platform_fee_cents": transaction.get("platform_fee_cents"),
+                "seller_net_cents": transaction.get("seller_amount_cents"),
             }
-            await db.purchases.insert_one(purchase_doc)
-    
+            try:
+                await db.purchases.insert_one(purchase_doc)
+            except Exception as e:
+                logger.exception("insert purchase session=%s", session_id)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Enregistrement de l'achat impossible: {e!s}",
+                )
+
     return {
-        "status": checkout_status.status,
-        "payment_status": checkout_status.payment_status,
-        "amount_total": checkout_status.amount_total,
-        "currency": checkout_status.currency
+        "status": checkout_status.get("status"),
+        "payment_status": checkout_status.get("payment_status"),
+        "amount_total": checkout_status.get("amount_total"),
+        "currency": checkout_status.get("currency"),
     }
 
 @api_router.post("/purchases/library")
@@ -1595,53 +1737,285 @@ async def get_follow_state(artist_ids: str, authorization: Optional[str] = Heade
 
 # ==================== WEBHOOK ROUTES ====================
 
+# Thin (Dashboard) : type `v1.checkout.session.completed` — pas l’objet complet dans le POST,
+# on récupère la session via `fetch_related_object()` après vérification du secret thin.
+THIN_CHECKOUT_SESSION_COMPLETED = "v1.checkout.session.completed"
+
+
+async def fulfill_checkout_session_completed(sess) -> None:
+    """Met à jour la transaction et crée l’achat si payé (snapshot ou session récupérée en thin)."""
+    session_id = sess["id"]
+    payment_status = sess.get("payment_status") or ""
+    md = sess.get("metadata") or {}
+    if md and not isinstance(md, dict):
+        md = dict(md)
+
+    await db.payment_transactions.update_one(
+        {"session_id": session_id},
+        {
+            "$set": {
+                "payment_status": payment_status,
+                "status": "complete" if payment_status == "paid" else sess.get("status", "open"),
+            }
+        },
+    )
+
+    if payment_status == "paid":
+        transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+        user_id = None
+        item_type = None
+        item_id = None
+        price_paid = None
+        artist_id_pub = None
+        platform_fee_pub = None
+        seller_net_pub = None
+        if transaction:
+            user_id = transaction["user_id"]
+            item_type = transaction["metadata"]["item_type"]
+            item_id = str(transaction["metadata"]["item_id"]).strip()
+            price_paid = transaction["amount"]
+            artist_id_pub = transaction.get("artist_id")
+            platform_fee_pub = transaction.get("platform_fee_cents")
+            seller_net_pub = transaction.get("seller_amount_cents")
+        else:
+            user_id = md.get("user_id")
+            item_type = md.get("item_type")
+            item_id = str(md.get("item_id") or "").strip()
+            at = sess.get("amount_total")
+            if at is not None:
+                price_paid = float(at)
+            else:
+                price_paid = 0.0
+            artist_id_pub = md.get("artist_id")
+
+        if user_id and item_type and item_id:
+            existing_purchase = await db.purchases.find_one(
+                {
+                    "user_id": user_id,
+                    "item_type": item_type,
+                    "item_id": item_id,
+                }
+            )
+            if not existing_purchase:
+                purchase_doc = {
+                    "purchase_id": f"purchase_{uuid.uuid4().hex[:12]}",
+                    "user_id": user_id,
+                    "item_type": item_type,
+                    "item_id": item_id,
+                    "price_paid": price_paid,
+                    "purchased_at": datetime.now(timezone.utc).isoformat(),
+                    "artist_id": artist_id_pub,
+                    "platform_fee_cents": platform_fee_pub,
+                    "seller_net_cents": seller_net_pub,
+                }
+                await db.purchases.insert_one(purchase_doc)
+
+
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
     ensure_stripe_available()
+    wh_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+    if not wh_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="STRIPE_WEBHOOK_SECRET manquant — ajoute le secret du webhook (Dashboard Stripe → Webhooks).",
+        )
+
     body_bytes = await request.body()
     signature = request.headers.get("Stripe-Signature")
-    
-    webhook_url = f"{str(request.base_url).rstrip('/')}/api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-    
+
     try:
-        webhook_response = await stripe_checkout.handle_webhook(body_bytes, signature)
-        
-        # Update transaction
-        await db.payment_transactions.update_one(
-            {"session_id": webhook_response.session_id},
-            {"$set": {
-                "payment_status": webhook_response.payment_status,
-                "status": "complete" if webhook_response.payment_status == "paid" else "failed"
-            }}
-        )
-        
-        # If paid, create purchase
-        if webhook_response.payment_status == "paid" and webhook_response.metadata:
-            transaction = await db.payment_transactions.find_one({"session_id": webhook_response.session_id}, {"_id": 0})
-            if transaction:
-                # Check if purchase already exists
-                existing_purchase = await db.purchases.find_one({
-                    "user_id": transaction["user_id"],
-                    "item_type": transaction["metadata"]["item_type"],
-                    "item_id": transaction["metadata"]["item_id"]
-                })
-                
-                if not existing_purchase:
-                    purchase_doc = {
-                        "purchase_id": f"purchase_{uuid.uuid4().hex[:12]}",
-                        "user_id": transaction["user_id"],
-                        "item_type": transaction["metadata"]["item_type"],
-                        "item_id": transaction["metadata"]["item_id"],
-                        "price_paid": transaction["amount"],
-                        "purchased_at": datetime.now(timezone.utc).isoformat()
-                    }
-                    await db.purchases.insert_one(purchase_doc)
-        
-        return {"status": "success"}
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        event = construct_webhook_event(body_bytes, signature)
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except stripe.error.SignatureVerificationError as e:
+        logger.warning("Stripe webhook signature: %s", e)
+        raise HTTPException(status_code=400, detail="Signature Stripe invalide")
+
+    if event["type"] == "checkout.session.completed":
+        await fulfill_checkout_session_completed(event["data"]["object"])
+
+    return {"received": True}
+
+
+@api_router.post("/webhook/stripe/thin")
+async def stripe_webhook_thin(request: Request):
+    """
+    Webhooks « thin » : notification légère signée avec STRIPE_WEBHOOK_SECRET_THIN.
+    Pour un paiement Checkout, on récupère la session complète côté API puis même logique que le snapshot.
+    """
+    ensure_stripe_available()
+    thin_secret = os.environ.get("STRIPE_WEBHOOK_SECRET_THIN", "").strip()
+    if not thin_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="STRIPE_WEBHOOK_SECRET_THIN manquant — secret de la destination *thin* (Dashboard Stripe → Webhooks).",
+        )
+
+    body_bytes = await request.body()
+    signature = request.headers.get("Stripe-Signature")
+
+    try:
+        event_notif = parse_thin_event_notification(body_bytes, signature)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except stripe.error.SignatureVerificationError as e:
+        logger.warning("Stripe thin webhook signature: %s", e)
+        raise HTTPException(status_code=400, detail="Signature Stripe invalide (thin)")
+
+    if event_notif.type != THIN_CHECKOUT_SESSION_COMPLETED:
+        logger.info("Stripe thin webhook ignoré (type=%s)", event_notif.type)
+        return {"received": True, "handled": False}
+
+    try:
+        sess = await asyncio.to_thread(event_notif.fetch_related_object)
+    except Exception as e:
+        logger.exception("Stripe thin fetch_related_object: %s", e)
+        raise HTTPException(status_code=500, detail="Impossible de récupérer la session Checkout")
+
+    if sess is None:
+        logger.warning("Stripe thin checkout.session.completed sans related_object")
+        return {"received": True, "handled": False}
+
+    await fulfill_checkout_session_completed(sess)
+    return {"received": True, "handled": True}
+
+# ==================== STRIPE CONNECT (ARTIST) ====================
+
+
+def _balance_amount_for_currency(bal: Any, kind: str, currency: str) -> int:
+    total = 0
+    lst = getattr(bal, kind, None) or []
+    cur = (currency or "").lower()
+    for m in lst:
+        c = getattr(m, "currency", None) or ""
+        if str(c).lower() == cur:
+            total += int(getattr(m, "amount", 0) or 0)
+    return total
+
+
+@api_router.get("/artist/stripe/connect/status")
+async def artist_stripe_connect_status(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    if user.get("role") != "artist":
+        raise HTTPException(status_code=403, detail="Réservé aux artistes")
+    ensure_stripe_available()
+    acct_id = user.get("stripe_connect_account_id")
+    if not acct_id:
+        return {
+            "has_account": False,
+            "charges_enabled": False,
+            "details_submitted": False,
+            "payouts_enabled": False,
+            "platform_fee_percent": get_platform_fee_percent(),
+            "connect_enabled": stripe_connect_enabled(),
+        }
+    try:
+        acct = await asyncio.to_thread(retrieve_connect_account, acct_id)
+    except stripe.error.StripeError as e:
+        logger.warning("Stripe retrieve account: %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {
+            "$set": {
+                "stripe_connect_charges_enabled": getattr(acct, "charges_enabled", False),
+                "stripe_connect_details_submitted": getattr(acct, "details_submitted", False),
+            }
+        },
+    )
+    return {
+        "has_account": True,
+        "account_id": acct_id,
+        "charges_enabled": getattr(acct, "charges_enabled", False),
+        "details_submitted": getattr(acct, "details_submitted", False),
+        "payouts_enabled": getattr(acct, "payouts_enabled", False),
+        "platform_fee_percent": get_platform_fee_percent(),
+        "connect_enabled": stripe_connect_enabled(),
+    }
+
+
+@api_router.post("/artist/stripe/connect/onboard")
+async def artist_stripe_connect_onboard(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    if user.get("role") != "artist":
+        raise HTTPException(status_code=403, detail="Réservé aux artistes")
+    ensure_stripe_available()
+    base = os.environ.get("PUBLIC_FRONTEND_URL", "http://localhost:3000").rstrip("/")
+    refresh_url = f"{base}/artist-dashboard?connect=refresh"
+    return_url = f"{base}/artist-dashboard?connect=return"
+
+    acct_id = user.get("stripe_connect_account_id")
+    try:
+        if not acct_id:
+
+            def _mk_acct():
+                return create_express_connected_account(email=user.get("email"), country="FR")
+
+            acct = await asyncio.to_thread(_mk_acct)
+            acct_id = acct.id
+            await db.users.update_one(
+                {"user_id": user["user_id"]},
+                {"$set": {"stripe_connect_account_id": acct_id}},
+            )
+
+        def _mk_link():
+            return create_account_onboarding_link(
+                account_id=acct_id,
+                refresh_url=refresh_url,
+                return_url=return_url,
+            )
+
+        link_url = await asyncio.to_thread(_mk_link)
+    except stripe.error.StripeError as e:
+        msg = getattr(e, "user_message", None) or str(e)
+        raise HTTPException(status_code=502, detail=f"Stripe: {msg}")
+    return {"url": link_url}
+
+
+@api_router.post("/artist/stripe/connect/login-link")
+async def artist_stripe_connect_login_link(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    if user.get("role") != "artist":
+        raise HTTPException(status_code=403, detail="Réservé aux artistes")
+    ensure_stripe_available()
+    acct_id = user.get("stripe_connect_account_id")
+    if not acct_id:
+        raise HTTPException(status_code=400, detail="Compte Stripe Connect non créé")
+    try:
+        url = await asyncio.to_thread(create_account_login_link, acct_id)
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"url": url}
+
+
+@api_router.get("/artist/stripe/connect/balance")
+async def artist_stripe_connect_balance(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    if user.get("role") != "artist":
+        raise HTTPException(status_code=403, detail="Réservé aux artistes")
+    ensure_stripe_available()
+    acct_id = user.get("stripe_connect_account_id")
+    if not acct_id:
+        raise HTTPException(status_code=400, detail="Compte Stripe Connect non créé")
+    try:
+        bal = await asyncio.to_thread(retrieve_connect_balance, acct_id)
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    cur = STRIPE_CURRENCY_ENV
+    available = _balance_amount_for_currency(bal, "available", cur)
+    pending = _balance_amount_for_currency(bal, "pending", cur)
+    try:
+        hint = float(os.environ.get("STRIPE_MIN_PAYOUT_HINT_EUROS", "20"))
+    except (TypeError, ValueError):
+        hint = 20.0
+    return {
+        "currency": cur,
+        "available_cents": available,
+        "pending_cents": pending,
+        "min_payout_hint_euros": hint,
+    }
+
 
 # ==================== ARTIST STATS ROUTES ====================
 
@@ -1681,7 +2055,7 @@ async def get_artist_stats(authorization: Optional[str] = Header(None), request:
     library_purchases = [p for p in purchases if purchase_amount_cents(p) == 0]
     total_sales = len(paid_purchases)
     total_library_adds = len(library_purchases)
-    total_revenue = sum(purchase_amount_cents(p) for p in paid_purchases)
+    total_revenue = sum(purchase_seller_net_cents(p) for p in paid_purchases)
     total_likes_tracks = sum(int(t.get("likes_count") or 0) for t in tracks)
     total_likes_albums = sum(int(a.get("likes_count") or 0) for a in albums)
 
@@ -1702,7 +2076,7 @@ async def get_artist_stats(authorization: Optional[str] = Header(None), request:
             "status": track.get("status", "draft"),
             "sales_count": len(paid_tp),
             "library_adds_count": len(free_tp),
-            "revenue": sum(purchase_amount_cents(p) for p in paid_tp),
+            "revenue": sum(purchase_seller_net_cents(p) for p in paid_tp),
             "play_count": play_n,
             "play_duration_sec": sum(p.get("duration_sec", 15) for p in track_plays),
             "likes_count": int(track.get("likes_count") or 0),
@@ -1728,7 +2102,7 @@ async def get_artist_stats(authorization: Optional[str] = Header(None), request:
             "cover_url": album.get("cover_url"),
             "sales_count": len(paid_ap),
             "library_adds_count": len(free_ap),
-            "revenue": sum(purchase_amount_cents(p) for p in paid_ap),
+            "revenue": sum(purchase_seller_net_cents(p) for p in paid_ap),
             "play_count": play_sum,
             "likes_count": int(album.get("likes_count") or 0),
             "status": album.get("status", "draft"),
@@ -1778,12 +2152,12 @@ async def get_artist_stats(authorization: Optional[str] = Header(None), request:
             "last_7_days": {
                 "sales": len(recent_paid),
                 "library_adds": len([p for p in recent_purchases if purchase_amount_cents(p) == 0]),
-                "revenue": sum(purchase_amount_cents(p) for p in recent_paid),
+                "revenue": sum(purchase_seller_net_cents(p) for p in recent_paid),
             },
             "last_30_days": {
                 "sales": len(monthly_paid),
                 "library_adds": len([p for p in monthly_purchases if purchase_amount_cents(p) == 0]),
-                "revenue": sum(purchase_amount_cents(p) for p in monthly_paid),
+                "revenue": sum(purchase_seller_net_cents(p) for p in monthly_paid),
             },
         },
         "track_stats": track_stats,

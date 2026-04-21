@@ -352,6 +352,21 @@ class UserSettings(BaseModel):
     privacy_share_listening_activity: bool = False
     privacy_personalized_ads: bool = False
 
+# ==================== ADMIN MODELS ====================
+
+class AdminTrackUpdate(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+    price: Optional[float] = None
+    is_free_price: Optional[bool] = None
+    min_price: Optional[float] = None
+
+
+class AdminAlbumUpdate(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+    price: Optional[float] = None
+
 # ==================== AUTH HELPERS ====================
 
 def hash_password(password: str) -> str:
@@ -430,6 +445,11 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
         raise HTTPException(status_code=401, detail="User not found")
     
     return user_doc
+
+def require_admin(user: dict) -> None:
+    role = str((user or {}).get("role", "")).strip().upper()
+    if role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Admin only")
 
 # ==================== AUTH ROUTES ====================
 
@@ -707,6 +727,11 @@ async def update_role(new_role: str, artist_name: Optional[str] = None, authoriz
     """Toggle between user and artist role"""
     user = await get_current_user(authorization, request)
     
+    # Prevent privilege escalation through this endpoint.
+    allowed = {"user", "artist"}
+    if new_role not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    
     # Si on passe en mode artist et qu'on a déjà un artist_name, le garder
     if new_role == "artist":
         # Si pas de nouveau nom fourni, garder l'ancien s'il existe
@@ -724,6 +749,324 @@ async def update_role(new_role: str, artist_name: Optional[str] = None, authoriz
     )
     
     return {"role": new_role, "artist_name": artist_name}
+
+# ==================== ADMIN ROUTES ====================
+
+@api_router.get("/admin/overview")
+async def admin_overview(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+
+    users_count = await db.users.count_documents({})
+    artists_count = await db.users.count_documents({"role": "artist"})
+    tracks_count = await db.tracks.count_documents({})
+    albums_count = await db.albums.count_documents({})
+    purchases_count = await db.purchases.count_documents({})
+    payment_txn_count = await db.payment_transactions.count_documents({})
+
+    paid_cursor = db.payment_transactions.find(
+        {"payment_status": "paid"},
+        {"_id": 0, "amount": 1, "platform_fee_cents": 1, "seller_amount_cents": 1, "created_at": 1},
+    )
+    paid = await paid_cursor.to_list(5000)
+
+    gross_cents = 0
+    fee_cents = 0
+    seller_net_cents = 0
+    daily: dict[str, dict[str, int]] = {}
+
+    for t in paid:
+        try:
+            gross_cents += int(round(float(t.get("amount") or 0)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            fee_cents += int(t.get("platform_fee_cents") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            seller_net_cents += int(t.get("seller_amount_cents") or 0)
+        except (TypeError, ValueError):
+            pass
+
+        iso = t.get("created_at") or ""
+        day = str(iso)[:10] if iso else ""
+        if day:
+            d = daily.setdefault(day, {"gross_cents": 0, "fee_cents": 0})
+            d["gross_cents"] += int(round(float(t.get("amount") or 0)))
+            d["fee_cents"] += int(t.get("platform_fee_cents") or 0)
+
+    series = [{"day": k, **daily[k]} for k in sorted(daily.keys())][-30:]
+
+    return {
+        "counts": {
+            "users": int(users_count),
+            "artists": int(artists_count),
+            "tracks": int(tracks_count),
+            "albums": int(albums_count),
+            "purchases": int(purchases_count),
+            "payment_transactions": int(payment_txn_count),
+            "paid_transactions": int(len(paid)),
+        },
+        "money": {
+            "gross_cents": int(gross_cents),
+            "platform_fees_cents": int(fee_cents),
+            "seller_net_cents": int(seller_net_cents),
+            "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
+            "platform_fee_percent": float(get_platform_fee_percent()),
+        },
+        "series_30d": series,
+    }
+
+
+@api_router.get("/admin/payment-transactions")
+async def admin_payment_transactions(
+    limit: int = Query(200, ge=1, le=2000),
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    cursor = (
+        db.payment_transactions.find(
+            {},
+            {
+                "_id": 0,
+                "transaction_id": 1,
+                "session_id": 1,
+                "user_id": 1,
+                "artist_id": 1,
+                "amount": 1,
+                "currency": 1,
+                "status": 1,
+                "payment_status": 1,
+                "metadata": 1,
+                "stripe_connect_account_id": 1,
+                "platform_fee_cents": 1,
+                "seller_amount_cents": 1,
+                "created_at": 1,
+            },
+        )
+        .sort("created_at", -1)
+        .limit(limit)
+    )
+    items = await cursor.to_list(limit)
+    return {"items": items}
+
+
+@api_router.get("/admin/logs")
+async def admin_logs(
+    limit: int = Query(200, ge=1, le=2000),
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    cursor = (
+        db.transactions.find({}, {"_id": 0})
+        .sort("created_at", -1)
+        .limit(limit)
+    )
+    items = await cursor.to_list(limit)
+    return {"items": items}
+
+
+@api_router.get("/admin/tracks")
+async def admin_tracks(
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    artist_id: Optional[str] = None,
+    limit: int = Query(300, ge=1, le=2000),
+    skip: int = Query(0, ge=0, le=200000),
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    query: dict = {}
+    if status:
+        query["status"] = str(status)
+    if artist_id:
+        query["artist_id"] = str(artist_id)
+    if q:
+        qs = str(q).strip()
+        if qs:
+            query["$or"] = [
+                {"track_id": {"$regex": qs, "$options": "i"}},
+                {"title": {"$regex": qs, "$options": "i"}},
+                {"artist_name": {"$regex": qs, "$options": "i"}},
+            ]
+    cursor = (
+        db.tracks.find(query, {"_id": 0})
+        .sort("created_at", -1)
+        .skip(skip)
+        .limit(limit)
+    )
+    items = await cursor.to_list(limit)
+    return {"items": items}
+
+
+@api_router.get("/admin/albums")
+async def admin_albums(
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    artist_id: Optional[str] = None,
+    limit: int = Query(300, ge=1, le=2000),
+    skip: int = Query(0, ge=0, le=200000),
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    query: dict = {}
+    if status:
+        query["status"] = str(status)
+    if artist_id:
+        query["artist_id"] = str(artist_id)
+    if q:
+        qs = str(q).strip()
+        if qs:
+            query["$or"] = [
+                {"album_id": {"$regex": qs, "$options": "i"}},
+                {"title": {"$regex": qs, "$options": "i"}},
+                {"artist_name": {"$regex": qs, "$options": "i"}},
+            ]
+    cursor = (
+        db.albums.find(query, {"_id": 0})
+        .sort("created_at", -1)
+        .skip(skip)
+        .limit(limit)
+    )
+    items = await cursor.to_list(limit)
+    return {"items": items}
+
+
+@api_router.get("/admin/tracks.csv")
+async def admin_tracks_csv(
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    cursor = db.tracks.find({}, {"_id": 0}).sort("created_at", -1).limit(5000)
+    items = await cursor.to_list(5000)
+
+    import csv
+    import io
+
+    output = io.StringIO()
+    fieldnames = [
+        "track_id",
+        "title",
+        "artist_id",
+        "artist_name",
+        "status",
+        "price",
+        "created_at",
+    ]
+    w = csv.DictWriter(output, fieldnames=fieldnames)
+    w.writeheader()
+    for it in items:
+        w.writerow({k: it.get(k, "") for k in fieldnames})
+    return Response(content=output.getvalue(), media_type="text/csv")
+
+
+@api_router.get("/admin/albums.csv")
+async def admin_albums_csv(
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    cursor = db.albums.find({}, {"_id": 0}).sort("created_at", -1).limit(5000)
+    items = await cursor.to_list(5000)
+
+    import csv
+    import io
+
+    output = io.StringIO()
+    fieldnames = [
+        "album_id",
+        "title",
+        "artist_id",
+        "artist_name",
+        "status",
+        "price",
+        "created_at",
+    ]
+    w = csv.DictWriter(output, fieldnames=fieldnames)
+    w.writeheader()
+    for it in items:
+        w.writerow({k: it.get(k, "") for k in fieldnames})
+    return Response(content=output.getvalue(), media_type="text/csv")
+
+
+@api_router.patch("/admin/tracks/{track_id}")
+async def admin_update_track(
+    track_id: str,
+    payload: AdminTrackUpdate,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.tracks.update_one({"track_id": track_id}, {"$set": data})
+    doc = await db.tracks.find_one({"track_id": track_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Track not found")
+    return doc
+
+
+@api_router.delete("/admin/tracks/{track_id}")
+async def admin_delete_track(
+    track_id: str,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    res = await db.tracks.delete_one({"track_id": track_id})
+    if not res.deleted_count:
+        raise HTTPException(status_code=404, detail="Track not found")
+    return {"deleted": True}
+
+
+@api_router.patch("/admin/albums/{album_id}")
+async def admin_update_album(
+    album_id: str,
+    payload: AdminAlbumUpdate,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.albums.update_one({"album_id": album_id}, {"$set": data})
+    doc = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Album not found")
+    return doc
+
+
+@api_router.delete("/admin/albums/{album_id}")
+async def admin_delete_album(
+    album_id: str,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    res = await db.albums.delete_one({"album_id": album_id})
+    if not res.deleted_count:
+        raise HTTPException(status_code=404, detail="Album not found")
+    return {"deleted": True}
 
 # ==================== ARTIST PROFILE ROUTES ====================
 

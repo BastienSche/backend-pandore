@@ -14,6 +14,22 @@ import stripe
 STRIPE_CURRENCY = os.environ.get("STRIPE_CURRENCY", "eur").lower()
 
 
+def _frontend_origin_from_env_or_request(origin_url: str) -> str:
+    """
+    Prefer a server-side configured frontend URL to avoid mismatched origins (http/https, port)
+    and fragile client-provided values.
+    """
+    env_origin = (os.environ.get("PUBLIC_FRONTEND_URL") or "").strip()
+    origin = (env_origin or origin_url or "").strip()
+    origin = origin.rstrip("/")
+    if not origin:
+        return ""
+    if not origin.startswith(("http://", "https://")):
+        # Last-resort normalization (prevents Stripe rejecting invalid URLs)
+        origin = "https://" + origin
+    return origin
+
+
 def configure_stripe() -> None:
     key = os.environ.get("STRIPE_API_KEY") or ""
     stripe.api_key = key or None
@@ -63,7 +79,9 @@ async def create_checkout_session(
 ) -> Dict[str, Any]:
     """Crée une session Stripe Checkout (hosted). Connect : destination + application_fee."""
     configure_stripe()
-    origin = origin_url.rstrip("/")
+    origin = _frontend_origin_from_env_or_request(origin_url)
+    if not origin:
+        raise ValueError("origin_url / PUBLIC_FRONTEND_URL manquant")
     success_url = f"{origin}/library?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{origin}/browse"
 

@@ -1,8 +1,8 @@
 from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Request, Header, Response, Query
-from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 import os
 import logging
 from pathlib import Path
@@ -12,10 +12,10 @@ import uuid
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
-import aiofiles
 import shutil
 import asyncio
 from urllib.parse import urlencode
+from bson import ObjectId
 
 import stripe
 from stripe_payments import (
@@ -48,6 +48,7 @@ if _legacy.exists():
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+fs = AsyncIOMotorGridFSBucket(db, bucket_name="uploads")
 
 # JWT Configuration
 JWT_SECRET = os.environ.get('JWT_SECRET', 'pandore_secret_key_change_in_production_2025')
@@ -63,16 +64,27 @@ GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
 FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
 
-# Create uploads directory
-UPLOADS_DIR = ROOT_DIR / "uploads"
-UPLOADS_DIR.mkdir(exist_ok=True)
-(UPLOADS_DIR / "audio").mkdir(exist_ok=True)
-(UPLOADS_DIR / "covers").mkdir(exist_ok=True)
-
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 logger = logging.getLogger(__name__)
+
+async def log_transaction_event(*, kind: str, data: dict) -> None:
+    """
+    Journal des transactions (achats / ajouts) sans données sensibles.
+    Ne stocke jamais de numéro de carte, IBAN, billing details, etc.
+    """
+    try:
+        await db.transactions.insert_one(
+            {
+                "event_id": f"txe_{uuid.uuid4().hex[:12]}",
+                "kind": kind,
+                "data": data,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    except Exception:
+        logger.exception("log_transaction_event kind=%s", kind)
 
 
 def purchase_amount_cents(p: dict) -> float:
@@ -780,18 +792,23 @@ async def upload_audio(file: UploadFile = File(...), authorization: Optional[str
     
     if user["role"] != "artist":
         raise HTTPException(status_code=403, detail="Only artists can upload audio")
-    
-    # Generate unique filename
-    file_ext = Path(file.filename).suffix
-    filename = f"{uuid.uuid4().hex}{file_ext}"
-    file_path = UPLOADS_DIR / "audio" / filename
-    
-    # Save file
-    async with aiofiles.open(file_path, 'wb') as f:
-        content = await file.read()
-        await f.write(content)
-    
-    return {"file_url": f"/api/files/audio/{filename}"}
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    file_id = await fs.upload_from_stream(
+        filename=file.filename or f"{uuid.uuid4().hex}.audio",
+        source=content,
+        metadata={
+            "kind": "audio",
+            "content_type": file.content_type or "application/octet-stream",
+            "uploader_user_id": user["user_id"],
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    return {"file_url": f"/api/files/audio/{str(file_id)}"}
 
 @api_router.post("/upload/cover")
 async def upload_cover(file: UploadFile = File(...), authorization: Optional[str] = Header(None), request: Request = None):
@@ -799,45 +816,75 @@ async def upload_cover(file: UploadFile = File(...), authorization: Optional[str
     
     if user["role"] != "artist":
         raise HTTPException(status_code=403, detail="Only artists can upload covers")
-    
-    # Generate unique filename
-    file_ext = Path(file.filename).suffix
-    filename = f"{uuid.uuid4().hex}{file_ext}"
-    file_path = UPLOADS_DIR / "covers" / filename
-    
-    # Save file
-    async with aiofiles.open(file_path, 'wb') as f:
-        content = await file.read()
-        await f.write(content)
-    
-    return {"cover_url": f"/api/files/covers/{filename}"}
 
-@api_router.get("/files/audio/{filename}")
-async def get_audio_file(filename: str, request: Request):
-    file_path = UPLOADS_DIR / "audio" / filename
-    if not file_path.exists():
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    file_id = await fs.upload_from_stream(
+        filename=file.filename or f"{uuid.uuid4().hex}.cover",
+        source=content,
+        metadata={
+            "kind": "cover",
+            "content_type": file.content_type or "application/octet-stream",
+            "uploader_user_id": user["user_id"],
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    return {"cover_url": f"/api/files/covers/{str(file_id)}"}
+
+@api_router.get("/files/audio/{file_id}")
+async def get_audio_file(file_id: str, request: Request):
+    try:
+        oid = ObjectId(file_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid file id")
+
+    try:
+        grid_out = await fs.open_download_stream(oid)
+    except Exception:
         raise HTTPException(status_code=404, detail="File not found")
-    
-    # Support range requests for audio preview
+
+    file_size = int(getattr(grid_out, "length", 0) or 0)
+    content_type = (
+        (getattr(grid_out, "metadata", None) or {}).get("content_type")
+        or getattr(grid_out, "content_type", None)
+        or "application/octet-stream"
+    )
+
+    # Support range requests for audio preview/streaming
     range_header = request.headers.get("range")
     if range_header:
         range_match = range_header.replace("bytes=", "").split("-")
         start = int(range_match[0])
-        file_size = file_path.stat().st_size
         end = int(range_match[1]) if range_match[1] else file_size - 1
-        
+
+        if file_size <= 0:
+            raise HTTPException(status_code=416, detail="Invalid range")
+        if start < 0 or end < start or end >= file_size:
+            raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable")
+
         async def iterfile():
-            async with aiofiles.open(file_path, 'rb') as f:
-                await f.seek(start)
-                remaining = end - start + 1
-                while remaining > 0:
-                    chunk_size = min(8192, remaining)
-                    data = await f.read(chunk_size)
-                    if not data:
+            # Try to seek efficiently if supported; otherwise discard bytes.
+            remaining = end - start + 1
+            try:
+                await grid_out.seek(start)  # type: ignore[attr-defined]
+            except Exception:
+                to_discard = start
+                while to_discard > 0:
+                    chunk = await grid_out.read(min(8192, to_discard))
+                    if not chunk:
                         break
-                    remaining -= len(data)
-                    yield data
-        
+                    to_discard -= len(chunk)
+
+            while remaining > 0:
+                data = await grid_out.read(min(8192, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
         return StreamingResponse(
             iterfile(),
             status_code=206,
@@ -845,18 +892,59 @@ async def get_audio_file(filename: str, request: Request):
                 "Content-Range": f"bytes {start}-{end}/{file_size}",
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(end - start + 1),
-                "Content-Type": "audio/mpeg"
+                "Content-Type": content_type,
             }
         )
-    
-    return FileResponse(file_path, media_type="audio/mpeg")
 
-@api_router.get("/files/covers/{filename}")
-async def get_cover_file(filename: str):
-    file_path = UPLOADS_DIR / "covers" / filename
-    if not file_path.exists():
+    async def iterfile_full():
+        while True:
+            data = await grid_out.read(8192)
+            if not data:
+                break
+            yield data
+
+    return StreamingResponse(
+        iterfile_full(),
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+            "Content-Type": content_type,
+        },
+    )
+
+@api_router.get("/files/covers/{file_id}")
+async def get_cover_file(file_id: str):
+    try:
+        oid = ObjectId(file_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid file id")
+
+    try:
+        grid_out = await fs.open_download_stream(oid)
+    except Exception:
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path)
+
+    file_size = int(getattr(grid_out, "length", 0) or 0)
+    content_type = (
+        (getattr(grid_out, "metadata", None) or {}).get("content_type")
+        or getattr(grid_out, "content_type", None)
+        or "application/octet-stream"
+    )
+
+    async def iterfile():
+        while True:
+            data = await grid_out.read(8192)
+            if not data:
+                break
+            yield data
+
+    return StreamingResponse(
+        iterfile(),
+        headers={
+            "Content-Length": str(file_size),
+            "Content-Type": content_type,
+        },
+    )
 
 # ==================== TRACK ROUTES ====================
 
@@ -1492,6 +1580,23 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
 
     await db.payment_transactions.insert_one(transaction_doc)
 
+    await log_transaction_event(
+        kind="checkout_created",
+        data={
+            "session_id": session_result["session_id"],
+            "transaction_id": transaction_doc["transaction_id"],
+            "user_id": user["user_id"],
+            "item_type": checkout_data.item_type,
+            "item_id": item_id,
+            "artist_id": artist_id,
+            "amount_cents": int(amount_total_cents),
+            "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
+            "connect_used": bool(use_connect),
+            "platform_fee_cents": int(fee_cents) if use_connect else 0,
+            "seller_net_cents": int(round(seller_amount)) if use_connect else int(amount_total_cents),
+        },
+    )
+
     return {"url": session_result["url"], "session_id": session_result["session_id"]}
 
 @api_router.get("/purchases/status/{session_id}")
@@ -1517,10 +1622,21 @@ async def get_checkout_status(session_id: str, authorization: Optional[str] = He
             ),
         )
     
-    # Get transaction
+    # Get transaction (may not exist in some edge cases; keep a minimal placeholder)
     transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
     if not transaction:
-        raise HTTPException(status_code=404, detail="Transaction not found")
+        transaction = {
+            "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
+            "session_id": session_id,
+            "user_id": user["user_id"],
+            "amount": 0.0,
+            "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
+            "status": "unknown",
+            "payment_status": "unknown",
+            "metadata": {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.payment_transactions.insert_one(transaction)
     
     if transaction["user_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -1544,6 +1660,7 @@ async def get_checkout_status(session_id: str, authorization: Optional[str] = He
             "$set": {
                 "status": checkout_status.get("status"),
                 "payment_status": checkout_status.get("payment_status"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         },
     )
@@ -1607,6 +1724,31 @@ async def get_checkout_status(session_id: str, authorization: Optional[str] = He
                     detail=f"Enregistrement de l'achat impossible: {e!s}",
                 )
 
+        await log_transaction_event(
+            kind="checkout_paid",
+            data={
+                "session_id": session_id,
+                "user_id": transaction["user_id"],
+                "item_type": item_type,
+                "item_id": item_id,
+                "artist_id": transaction.get("artist_id") or md_stripe.get("artist_id"),
+                "amount_cents": int(round(float(transaction.get("amount") or 0))),
+                "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
+                "source": "status_endpoint",
+            },
+        )
+
+    await log_transaction_event(
+        kind="checkout_status_checked",
+        data={
+            "session_id": session_id,
+            "user_id": transaction["user_id"],
+            "status": checkout_status.get("status"),
+            "payment_status": checkout_status.get("payment_status"),
+            "source": "status_endpoint",
+        },
+    )
+
     return {
         "status": checkout_status.get("status"),
         "payment_status": checkout_status.get("payment_status"),
@@ -1661,6 +1803,18 @@ async def add_to_library(payload: AddToLibraryRequest, authorization: Optional[s
         "purchased_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.purchases.insert_one(purchase_doc)
+    await log_transaction_event(
+        kind="library_add_free",
+        data={
+            "purchase_id": purchase_doc["purchase_id"],
+            "user_id": user["user_id"],
+            "item_type": payload.item_type,
+            "item_id": payload.item_id,
+            "amount_cents": 0,
+            "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
+            "source": "library_endpoint",
+        },
+    )
     return {"message": "Ajouté à la bibliothèque", "purchase_id": purchase_doc["purchase_id"]}
 
 @api_router.get("/purchases/library")
@@ -1750,14 +1904,32 @@ async def fulfill_checkout_session_completed(sess) -> None:
     if md and not isinstance(md, dict):
         md = dict(md)
 
+    base_update = {
+        "payment_status": payment_status,
+        "status": "complete" if payment_status == "paid" else sess.get("status", "open"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    at = sess.get("amount_total")
+    if at is not None:
+        try:
+            base_update["amount"] = float(at)
+        except (TypeError, ValueError):
+            pass
+
+    # Ensure a row exists even if created elsewhere.
     await db.payment_transactions.update_one(
         {"session_id": session_id},
         {
-            "$set": {
-                "payment_status": payment_status,
-                "status": "complete" if payment_status == "paid" else sess.get("status", "open"),
-            }
+            "$setOnInsert": {
+                "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
+                "session_id": session_id,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
+                "metadata": {},
+            },
+            "$set": base_update,
         },
+        upsert=True,
     )
 
     if payment_status == "paid":
@@ -1809,6 +1981,20 @@ async def fulfill_checkout_session_completed(sess) -> None:
                     "seller_net_cents": seller_net_pub,
                 }
                 await db.purchases.insert_one(purchase_doc)
+
+        await log_transaction_event(
+            kind="checkout_completed",
+            data={
+                "session_id": session_id,
+                "user_id": user_id,
+                "item_type": item_type,
+                "item_id": item_id,
+                "artist_id": artist_id_pub,
+                "amount_cents": int(round(float(price_paid or 0))),
+                "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
+                "source": "webhook",
+            },
+        )
 
 
 @api_router.post("/webhook/stripe")
@@ -1941,7 +2127,7 @@ async def artist_stripe_connect_onboard(authorization: Optional[str] = Header(No
     if user.get("role") != "artist":
         raise HTTPException(status_code=403, detail="Réservé aux artistes")
     ensure_stripe_available()
-    base = os.environ.get("PUBLIC_FRONTEND_URL", "http://localhost:3000").rstrip("/")
+    base = os.environ.get("PUBLIC_FRONTEND_URL", "https://localhost:3000").rstrip("/")
     refresh_url = f"{base}/artist-dashboard?connect=refresh"
     return_url = f"{base}/artist-dashboard?connect=return"
 

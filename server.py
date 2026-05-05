@@ -44,6 +44,29 @@ _legacy = ROOT_DIR / ".env"
 if _legacy.exists():
     load_dotenv(_legacy, override=True)
 
+def _read_docker_secret(name: str) -> str | None:
+    """
+    Read a Docker "secret" mounted by docker compose under /run/secrets/<name>.
+    Returns None if not present (e.g. local dev).
+    """
+    try:
+        p = Path("/run/secrets") / name
+        if p.exists():
+            v = p.read_text().strip()
+            return v or None
+    except Exception:
+        pass
+    return None
+
+# Docker compose secrets (prod): populate env so stripe_payments.py can keep using os.environ.
+_stripe_sk = _read_docker_secret("stripe_sk")
+if _stripe_sk and not (os.environ.get("STRIPE_API_KEY") or "").strip():
+    os.environ["STRIPE_API_KEY"] = _stripe_sk
+
+_stripe_whsec = _read_docker_secret("stripe_whsec")
+if _stripe_whsec and not (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip():
+    os.environ["STRIPE_WEBHOOK_SECRET"] = _stripe_whsec
+
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
@@ -201,9 +224,18 @@ class TrackCreate(BaseModel):
     description: Optional[str] = None
     album_id: Optional[str] = None
     preview_start_time: int = 0
+    preview_duration_sec: Optional[int] = 15
     duration_sec: Optional[int] = None
     mastering: Optional[dict] = None  # {"engineer": "name", "details": "info"}
     splits: Optional[List[dict]] = None  # [{"party": "name", "percent": 50}]
+    bpm: Optional[int] = None
+    key: Optional[str] = None
+    isrc: Optional[str] = None
+    release_date: Optional[str] = None
+    mix_version: Optional[str] = None  # maquette|mixed
+    availability: Optional[str] = None  # exclusive|all_platforms
+    producer: Optional[str] = None
+    beatmaker: Optional[str] = None
     status: str = "draft"  # draft|published
 
 class TrackResponse(BaseModel):
@@ -224,6 +256,14 @@ class TrackResponse(BaseModel):
     description: Optional[str]
     mastering: Optional[dict]
     splits: Optional[List[dict]]
+    bpm: Optional[int] = None
+    key: Optional[str] = None
+    isrc: Optional[str] = None
+    release_date: Optional[str] = None
+    mix_version: Optional[str] = None
+    availability: Optional[str] = None
+    producer: Optional[str] = None
+    beatmaker: Optional[str] = None
     status: str
     likes_count: int
     play_count: int = 0
@@ -235,6 +275,10 @@ class AlbumCreate(BaseModel):
     is_free_price: bool = False
     min_price: Optional[float] = None  # Minimum en cents (si prix libre)
     description: Optional[str] = None
+    mix_version: Optional[str] = None  # maquette|mixed
+    availability: Optional[str] = None  # exclusive|all_platforms
+    producer: Optional[str] = None
+    beatmaker: Optional[str] = None
     status: str = "draft"  # draft|published
 
 class AlbumResponse(BaseModel):
@@ -247,6 +291,10 @@ class AlbumResponse(BaseModel):
     min_price: Optional[float] = None
     cover_url: Optional[str]
     description: Optional[str]
+    mix_version: Optional[str] = None
+    availability: Optional[str] = None
+    producer: Optional[str] = None
+    beatmaker: Optional[str] = None
     track_ids: List[str]
     status: str
     likes_count: int
@@ -261,9 +309,18 @@ class AlbumTrackCreate(BaseModel):
     genre: str
     description: Optional[str] = None
     preview_start_time: int = 0
+    preview_duration_sec: Optional[int] = 15
     duration_sec: Optional[int] = None
     mastering: Optional[dict] = None
     splits: Optional[List[dict]] = None
+    bpm: Optional[int] = None
+    key: Optional[str] = None
+    isrc: Optional[str] = None
+    release_date: Optional[str] = None
+    mix_version: Optional[str] = None
+    availability: Optional[str] = None
+    producer: Optional[str] = None
+    beatmaker: Optional[str] = None
     status: str = "draft"
 
 class AlbumTrackResponse(BaseModel):
@@ -284,6 +341,14 @@ class AlbumTrackResponse(BaseModel):
     description: Optional[str]
     mastering: Optional[dict]
     splits: Optional[List[dict]]
+    bpm: Optional[int] = None
+    key: Optional[str] = None
+    isrc: Optional[str] = None
+    release_date: Optional[str] = None
+    mix_version: Optional[str] = None
+    availability: Optional[str] = None
+    producer: Optional[str] = None
+    beatmaker: Optional[str] = None
     status: str
     likes_count: int
     play_count: int = 0
@@ -1312,13 +1377,21 @@ async def create_track(track_data: TrackCreate, authorization: Optional[str] = H
         "duration": track_data.duration_sec,
         "preview_url": "",
         "preview_start_time": track_data.preview_start_time,
-        "preview_duration": 15,
+        "preview_duration": int(track_data.preview_duration_sec or 15),
         "file_url": "",
         "cover_url": None,
         "genre": track_data.genre,
         "description": track_data.description,
         "mastering": track_data.mastering,
         "splits": track_data.splits or [],
+        "bpm": track_data.bpm,
+        "key": track_data.key,
+        "isrc": track_data.isrc,
+        "release_date": track_data.release_date,
+        "mix_version": track_data.mix_version,
+        "availability": track_data.availability,
+        "producer": track_data.producer,
+        "beatmaker": track_data.beatmaker,
         "status": track_data.status,
         "likes_count": 0,
         "play_count": 0,
@@ -1407,6 +1480,10 @@ async def create_album(album_data: AlbumCreate, authorization: Optional[str] = H
         "min_price": album_data.min_price if album_data.is_free_price else None,
         "cover_url": None,
         "description": album_data.description,
+        "mix_version": album_data.mix_version,
+        "availability": album_data.availability,
+        "producer": album_data.producer,
+        "beatmaker": album_data.beatmaker,
         "track_ids": [],
         "status": album_data.status,
         "likes_count": 0,
@@ -1469,13 +1546,21 @@ async def create_album_track(album_id: str, track_data: AlbumTrackCreate, author
         "duration": track_data.duration_sec,
         "preview_url": "",
         "preview_start_time": track_data.preview_start_time,
-        "preview_duration": 15,
+        "preview_duration": int(track_data.preview_duration_sec or 15),
         "file_url": "",
         "cover_url": None,
         "genre": track_data.genre,
         "description": track_data.description,
         "mastering": track_data.mastering,
         "splits": track_data.splits or [],
+        "bpm": track_data.bpm,
+        "key": track_data.key,
+        "isrc": track_data.isrc,
+        "release_date": track_data.release_date,
+        "mix_version": track_data.mix_version,
+        "availability": track_data.availability,
+        "producer": track_data.producer,
+        "beatmaker": track_data.beatmaker,
         "status": track_data.status,
         "likes_count": 0,
         "created_at": datetime.now(timezone.utc).isoformat()

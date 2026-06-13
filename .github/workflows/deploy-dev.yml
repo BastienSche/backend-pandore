@@ -42,7 +42,7 @@ jobs:
               git -C frontend-pandore-dev reset --hard origin/develop
             fi
 
-            docker compose up -d --build backend_dev frontend_dev caddy
+            docker compose up -d --build --no-deps backend_dev frontend_dev caddy
 
             # Keep legacy prod folders up to date for transition safety.
             if [ -d backend-pandore/.git ]; then

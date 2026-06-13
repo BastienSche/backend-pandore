@@ -1,0 +1,38 @@
+name: Deploy Prod Stack
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: true
+
+jobs:
+  deploy-prod:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy main stack on VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          port: ${{ secrets.VPS_PORT }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd ${{ secrets.VPS_APP_DIR }}
+
+            git -C backend-pandore fetch origin
+            git -C backend-pandore checkout main
+            git -C backend-pandore reset --hard origin/main
+
+            git -C frontend-pandore fetch origin
+            git -C frontend-pandore checkout main
+            git -C frontend-pandore reset --hard origin/main
+
+            docker compose up -d --build backend frontend caddy
+            docker image prune -f

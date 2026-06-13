@@ -1,0 +1,38 @@
+name: Deploy Dev Stack
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
+jobs:
+  deploy-dev:
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - name: Deploy develop stack on VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          port: ${{ secrets.VPS_PORT }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd ${{ secrets.VPS_APP_DIR }}
+
+            git -C backend-pandore fetch origin
+            git -C backend-pandore checkout develop
+            git -C backend-pandore reset --hard origin/develop
+
+            git -C frontend-pandore fetch origin
+            git -C frontend-pandore checkout develop
+            git -C frontend-pandore reset --hard origin/develop
+
+            docker compose up -d --build backend_dev frontend_dev caddy
+            docker image prune -f

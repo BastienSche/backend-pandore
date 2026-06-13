@@ -26,13 +26,34 @@ jobs:
             set -e
             cd ${{ secrets.VPS_APP_DIR }}
 
-            git -C backend-pandore fetch origin
-            git -C backend-pandore checkout develop
-            git -C backend-pandore reset --hard origin/develop
+            if [ ! -d backend-pandore-dev/.git ]; then
+              git clone --branch develop --single-branch https://github.com/BastienSche/backend-pandore.git backend-pandore-dev
+            else
+              git -C backend-pandore-dev fetch origin
+              git -C backend-pandore-dev checkout develop
+              git -C backend-pandore-dev reset --hard origin/develop
+            fi
 
-            git -C frontend-pandore fetch origin
-            git -C frontend-pandore checkout develop
-            git -C frontend-pandore reset --hard origin/develop
+            if [ ! -d frontend-pandore-dev/.git ]; then
+              git clone --branch develop --single-branch https://github.com/BastienSche/frontend-pandore.git frontend-pandore-dev
+            else
+              git -C frontend-pandore-dev fetch origin
+              git -C frontend-pandore-dev checkout develop
+              git -C frontend-pandore-dev reset --hard origin/develop
+            fi
 
             docker compose up -d --build backend_dev frontend_dev caddy
+
+            # Keep legacy prod folders up to date for transition safety.
+            if [ -d backend-pandore/.git ]; then
+              git -C backend-pandore fetch origin
+              git -C backend-pandore checkout main
+              git -C backend-pandore reset --hard origin/main
+            fi
+            if [ -d frontend-pandore/.git ]; then
+              git -C frontend-pandore fetch origin
+              git -C frontend-pandore checkout main
+              git -C frontend-pandore reset --hard origin/main
+            fi
+
             docker image prune -f

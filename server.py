@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Request, Header, Response, Query
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form, Request, Header, Response, Query
 from fastapi.responses import StreamingResponse, RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -479,6 +479,18 @@ class AdminAlbumUpdate(BaseModel):
     title: Optional[str] = None
     status: Optional[str] = None
     price: Optional[float] = None
+
+class FeedbackSubmissionResponse(BaseModel):
+    feedback_id: str
+    title: str
+    description: str
+    image_url: Optional[str] = None
+    image_name: Optional[str] = None
+    reporter_user_id: Optional[str] = None
+    reporter_email: Optional[str] = None
+    reporter_name: Optional[str] = None
+    created_at: str
+    status: str = "new"
 
 # ==================== AUTH HELPERS ====================
 
@@ -1079,6 +1091,59 @@ async def admin_overview(authorization: Optional[str] = Header(None), request: R
         "series_30d": series,
     }
 
+@api_router.get("/admin/storage")
+async def admin_storage(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+
+    # Container filesystem stats (useful to detect low disk scenarios)
+    disk_total = None
+    disk_used = None
+    disk_free = None
+    try:
+        du = shutil.disk_usage("/")
+        disk_total = int(du.total)
+        disk_used = int(du.used)
+        disk_free = int(du.free)
+    except Exception:
+        pass
+
+    # MongoDB stats
+    mongo_data_size = None
+    mongo_storage_size = None
+    mongo_index_size = None
+    try:
+        db_stats = await db.command("dbStats")
+        mongo_data_size = int(db_stats.get("dataSize") or 0)
+        mongo_storage_size = int(db_stats.get("storageSize") or 0)
+        mongo_index_size = int(db_stats.get("indexSize") or 0)
+    except Exception:
+        pass
+
+    # GridFS ("uploads" bucket) footprint
+    gridfs_files_count = 0
+    gridfs_total_bytes = 0
+    try:
+        gridfs_files_count = int(await db["uploads.files"].count_documents({}))
+        agg = await db["uploads.files"].aggregate(
+            [{"$group": {"_id": None, "total": {"$sum": "$length"}}}]
+        ).to_list(1)
+        if agg:
+            gridfs_total_bytes = int(agg[0].get("total") or 0)
+    except Exception:
+        pass
+
+    return {
+        "disk_total_bytes": disk_total,
+        "disk_used_bytes": disk_used,
+        "disk_free_bytes": disk_free,
+        "mongo_data_size_bytes": mongo_data_size,
+        "mongo_storage_size_bytes": mongo_storage_size,
+        "mongo_index_size_bytes": mongo_index_size,
+        "gridfs_files_count": gridfs_files_count,
+        "gridfs_total_bytes": gridfs_total_bytes,
+    }
+
 
 @api_router.get("/admin/payment-transactions")
 async def admin_payment_transactions(
@@ -1125,6 +1190,99 @@ async def admin_logs(
     require_admin(user)
     cursor = (
         db.transactions.find({}, {"_id": 0})
+        .sort("created_at", -1)
+        .limit(limit)
+    )
+    items = await cursor.to_list(limit)
+    return {"items": items}
+
+@api_router.post("/feedback")
+async def submit_feedback(
+    title: str = Form(...),
+    description: str = Form(...),
+    image: Optional[UploadFile] = File(None),
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    title_clean = str(title or "").strip()
+    description_clean = str(description or "").strip()
+    if not title_clean:
+        raise HTTPException(status_code=400, detail="Le titre est requis")
+    if not description_clean:
+        raise HTTPException(status_code=400, detail="La description est requise")
+    if len(title_clean) > 180:
+        raise HTTPException(status_code=400, detail="Le titre est trop long (max 180)")
+    if len(description_clean) > 6000:
+        raise HTTPException(status_code=400, detail="La description est trop longue (max 6000)")
+
+    image_url = None
+    image_name = None
+    if image is not None:
+        content = await image.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Image vide")
+        if len(content) > 8 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Image trop lourde (max 8MB)")
+        content_type = str(image.content_type or "").lower().strip()
+        if not content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Le fichier doit être une image")
+        file_id = await fs.upload_from_stream(
+            filename=image.filename or f"{uuid.uuid4().hex}.feedback",
+            source=content,
+            metadata={
+                "kind": "feedback_image",
+                "content_type": content_type or "application/octet-stream",
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        image_url = f"/api/files/covers/{str(file_id)}"
+        image_name = image.filename
+
+    reporter_user_id = None
+    reporter_email = None
+    reporter_name = None
+    try:
+        current_user = await get_current_user(authorization, request)
+        reporter_user_id = current_user.get("user_id")
+        reporter_email = current_user.get("email")
+        reporter_name = current_user.get("name") or current_user.get("artist_name")
+    except Exception:
+        pass
+
+    feedback_id = f"feedback_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    forwarded_for = request.headers.get("x-forwarded-for") if request else None
+    client_ip = (forwarded_for.split(",")[0].strip() if forwarded_for else None) or (
+        request.client.host if request and request.client else None
+    )
+
+    feedback_doc = {
+        "feedback_id": feedback_id,
+        "title": title_clean,
+        "description": description_clean,
+        "image_url": image_url,
+        "image_name": image_name,
+        "reporter_user_id": reporter_user_id,
+        "reporter_email": reporter_email,
+        "reporter_name": reporter_name,
+        "client_ip": client_ip,
+        "user_agent": request.headers.get("user-agent") if request else None,
+        "created_at": now,
+        "status": "new",
+    }
+    await db.feedback_submissions.insert_one(feedback_doc)
+    return {"submitted": True, "feedback_id": feedback_id}
+
+@api_router.get("/admin/feedback")
+async def admin_feedback(
+    limit: int = Query(300, ge=1, le=2000),
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    cursor = (
+        db.feedback_submissions.find({}, {"_id": 0})
         .sort("created_at", -1)
         .limit(limit)
     )

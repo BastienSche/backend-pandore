@@ -1091,6 +1091,59 @@ async def admin_overview(authorization: Optional[str] = Header(None), request: R
         "series_30d": series,
     }
 
+@api_router.get("/admin/storage")
+async def admin_storage(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+
+    # Container filesystem stats (useful to detect low disk scenarios)
+    disk_total = None
+    disk_used = None
+    disk_free = None
+    try:
+        du = shutil.disk_usage("/")
+        disk_total = int(du.total)
+        disk_used = int(du.used)
+        disk_free = int(du.free)
+    except Exception:
+        pass
+
+    # MongoDB stats
+    mongo_data_size = None
+    mongo_storage_size = None
+    mongo_index_size = None
+    try:
+        db_stats = await db.command("dbStats")
+        mongo_data_size = int(db_stats.get("dataSize") or 0)
+        mongo_storage_size = int(db_stats.get("storageSize") or 0)
+        mongo_index_size = int(db_stats.get("indexSize") or 0)
+    except Exception:
+        pass
+
+    # GridFS ("uploads" bucket) footprint
+    gridfs_files_count = 0
+    gridfs_total_bytes = 0
+    try:
+        gridfs_files_count = int(await db["uploads.files"].count_documents({}))
+        agg = await db["uploads.files"].aggregate(
+            [{"$group": {"_id": None, "total": {"$sum": "$length"}}}]
+        ).to_list(1)
+        if agg:
+            gridfs_total_bytes = int(agg[0].get("total") or 0)
+    except Exception:
+        pass
+
+    return {
+        "disk_total_bytes": disk_total,
+        "disk_used_bytes": disk_used,
+        "disk_free_bytes": disk_free,
+        "mongo_data_size_bytes": mongo_data_size,
+        "mongo_storage_size_bytes": mongo_storage_size,
+        "mongo_index_size_bytes": mongo_index_size,
+        "gridfs_files_count": gridfs_files_count,
+        "gridfs_total_bytes": gridfs_total_bytes,
+    }
+
 
 @api_router.get("/admin/payment-transactions")
 async def admin_payment_transactions(

@@ -42,7 +42,7 @@ if _primary.exists():
     load_dotenv(_primary)
 _legacy = ROOT_DIR / ".env"
 if _legacy.exists():
-    load_dotenv(_legacy, override=True)
+    load_dotenv(_legacy, override=False)
 
 def _read_docker_secret(name: str) -> str | None:
     """

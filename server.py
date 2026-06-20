@@ -9,6 +9,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from typing import Any, List, Optional, Literal
 import uuid
+import secrets
+import hashlib
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
@@ -86,6 +88,9 @@ GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
 GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
 FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
+PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
+FRONTEND_RESET_PASSWORD_URL = os.environ.get("FRONTEND_RESET_PASSWORD_URL", "").rstrip("/")
+PASSWORD_RESET_TOKEN_TTL_MINUTES = int(os.environ.get("PASSWORD_RESET_TOKEN_TTL_MINUTES", "30"))
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -214,6 +219,13 @@ class GoogleSessionResponse(BaseModel):
     name: str
     picture: Optional[str]
     session_token: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=6)
 
 class TrackCreate(BaseModel):
     title: str
@@ -447,6 +459,20 @@ def create_jwt_token(user_id: str) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+def hash_reset_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+def build_reset_password_url(raw_token: str) -> str:
+    if FRONTEND_RESET_PASSWORD_URL:
+        base = FRONTEND_RESET_PASSWORD_URL
+    elif PUBLIC_FRONTEND_URL:
+        base = f"{PUBLIC_FRONTEND_URL}/reset-password"
+    else:
+        # fallback local dev
+        base = "http://localhost:3000/reset-password"
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}token={raw_token}"
+
 def ensure_google_oauth_configured():
     if not GOOGLE_OAUTH_CLIENT_ID or not GOOGLE_OAUTH_CLIENT_SECRET or not GOOGLE_OAUTH_REDIRECT_URI:
         raise HTTPException(status_code=500, detail="Google OAuth is not configured")
@@ -565,6 +591,86 @@ async def login(credentials: UserLogin, response: Response):
         "token": token,
         "user": UserResponse(**user_doc)
     }
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordRequest):
+    """
+    Toujours renvoyer un message générique pour éviter l'énumération des emails.
+    En local/dev, on renvoie aussi le token/lien pour faciliter les tests.
+    """
+    generic_message = "Si cet email existe, un lien de réinitialisation a été généré."
+    user_doc = await db.users.find_one({"email": payload.email}, {"_id": 0})
+    if not user_doc:
+        return {"message": generic_message}
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hash_reset_token(raw_token)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=PASSWORD_RESET_TOKEN_TTL_MINUTES)
+
+    # Invalide les anciens tokens non utilisés pour ce compte
+    await db.password_reset_tokens.delete_many({"user_id": user_doc["user_id"], "used_at": None})
+    await db.password_reset_tokens.insert_one(
+        {
+            "token_hash": token_hash,
+            "user_id": user_doc["user_id"],
+            "email": user_doc.get("email"),
+            "created_at": now.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "used_at": None,
+        }
+    )
+
+    reset_url = build_reset_password_url(raw_token)
+    logger.info("password-reset-link user_id=%s url=%s", user_doc["user_id"], reset_url)
+
+    if _app_env != "production":
+        return {
+            "message": generic_message,
+            "reset_token": raw_token,
+            "reset_url": reset_url,
+            "expires_in_minutes": PASSWORD_RESET_TOKEN_TTL_MINUTES,
+        }
+    return {"message": generic_message}
+
+@api_router.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordRequest):
+    token_hash = hash_reset_token(payload.token)
+    token_doc = await db.password_reset_tokens.find_one({"token_hash": token_hash, "used_at": None}, {"_id": 0})
+    if not token_doc:
+        raise HTTPException(status_code=400, detail="Token invalide ou expiré")
+
+    expires_at = token_doc.get("expires_at")
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if not expires_at:
+        raise HTTPException(status_code=400, detail="Token invalide ou expiré")
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        await db.password_reset_tokens.update_one(
+            {"token_hash": token_hash},
+            {"$set": {"used_at": datetime.now(timezone.utc).isoformat()}},
+        )
+        raise HTTPException(status_code=400, detail="Token invalide ou expiré")
+
+    user_doc = await db.users.find_one({"user_id": token_doc["user_id"]}, {"_id": 0})
+    if not user_doc:
+        raise HTTPException(status_code=400, detail="Token invalide ou expiré")
+
+    new_hash = hash_password(payload.new_password)
+    await db.users.update_one(
+        {"user_id": user_doc["user_id"]},
+        {"$set": {"password_hash": new_hash}},
+    )
+    await db.password_reset_tokens.update_one(
+        {"token_hash": token_hash},
+        {"$set": {"used_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    # Invalide les sessions OAuth éventuelles
+    await db.user_sessions.delete_many({"user_id": user_doc["user_id"]})
+
+    return {"message": "Mot de passe réinitialisé avec succès"}
 
 @api_router.get("/auth/google/login")
 async def google_login():

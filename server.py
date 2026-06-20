@@ -5,12 +5,17 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 import os
 import logging
+import json
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from typing import Any, List, Optional, Literal
 import uuid
 import secrets
 import hashlib
+import smtplib
+import ssl
+from email.message import EmailMessage
+from email.utils import formataddr
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
@@ -89,8 +94,39 @@ GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
 FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
 PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
-FRONTEND_RESET_PASSWORD_URL = os.environ.get("FRONTEND_RESET_PASSWORD_URL", "").rstrip("/")
-PASSWORD_RESET_TOKEN_TTL_MINUTES = int(os.environ.get("PASSWORD_RESET_TOKEN_TTL_MINUTES", "30"))
+
+def _load_password_reset_config() -> dict:
+    cfg = {}
+    candidates = [
+        ROOT_DIR / "password_reset.config.json",
+        ROOT_DIR / "password_reset.config.local.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg.update(raw)
+        except Exception:
+            logging.getLogger(__name__).exception("Impossible de lire la config reset password: %s", path)
+    return cfg
+
+PASSWORD_RESET_CONFIG = _load_password_reset_config()
+PASSWORD_RESET_SMTP = PASSWORD_RESET_CONFIG.get("smtp") if isinstance(PASSWORD_RESET_CONFIG.get("smtp"), dict) else {}
+
+FRONTEND_RESET_PASSWORD_URL = str(PASSWORD_RESET_CONFIG.get("frontend_reset_password_url") or "").strip().rstrip("/")
+PASSWORD_RESET_TOKEN_TTL_MINUTES = int(PASSWORD_RESET_CONFIG.get("token_ttl_minutes") or 30)
+
+# SMTP / email (forgot password) depuis password_reset.config*.json
+SMTP_HOST = str(PASSWORD_RESET_SMTP.get("host") or "").strip()
+SMTP_PORT = int(PASSWORD_RESET_SMTP.get("port") or 587)
+SMTP_USERNAME = str(PASSWORD_RESET_SMTP.get("username") or "").strip()
+SMTP_PASSWORD = str(PASSWORD_RESET_SMTP.get("password") or "")
+SMTP_FROM_EMAIL = str(PASSWORD_RESET_SMTP.get("from_email") or "").strip()
+SMTP_FROM_NAME = str(PASSWORD_RESET_SMTP.get("from_name") or "Kloud").strip()
+SMTP_REPLY_TO = str(PASSWORD_RESET_SMTP.get("reply_to") or "").strip()
+SMTP_USE_TLS = str(PASSWORD_RESET_SMTP.get("use_tls", True)).strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -473,6 +509,44 @@ def build_reset_password_url(raw_token: str) -> str:
     sep = "&" if "?" in base else "?"
     return f"{base}{sep}token={raw_token}"
 
+def smtp_configured() -> bool:
+    return bool(SMTP_HOST and SMTP_FROM_EMAIL)
+
+def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+    subject = "Réinitialisation de votre mot de passe Kloud"
+    recipient_name = (to_name or "").strip() or "there"
+    plain_text = (
+        f"Bonjour {recipient_name},\n\n"
+        "Nous avons reçu une demande de réinitialisation de mot de passe.\n"
+        f"Ouvrir ce lien (valide {PASSWORD_RESET_TOKEN_TTL_MINUTES} minutes) :\n{reset_url}\n\n"
+        "Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.\n\n"
+        "— Kloud"
+    )
+    html = (
+        f"<p>Bonjour {recipient_name},</p>"
+        "<p>Nous avons reçu une demande de réinitialisation de mot de passe.</p>"
+        f"<p><a href=\"{reset_url}\">Réinitialiser mon mot de passe</a></p>"
+        f"<p>Ce lien est valide <strong>{PASSWORD_RESET_TOKEN_TTL_MINUTES} minutes</strong>.</p>"
+        "<p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>"
+        "<p>— Kloud</p>"
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = formataddr((SMTP_FROM_NAME, SMTP_FROM_EMAIL))
+    msg["To"] = to_email
+    if SMTP_REPLY_TO:
+        msg["Reply-To"] = SMTP_REPLY_TO
+    msg.set_content(plain_text)
+    msg.add_alternative(html, subtype="html")
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+        if SMTP_USE_TLS:
+            smtp.starttls(context=ssl.create_default_context())
+        if SMTP_USERNAME:
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+        smtp.send_message(msg)
+
 def ensure_google_oauth_configured():
     if not GOOGLE_OAUTH_CLIENT_ID or not GOOGLE_OAUTH_CLIENT_SECRET or not GOOGLE_OAUTH_REDIRECT_URI:
         raise HTTPException(status_code=500, detail="Google OAuth is not configured")
@@ -596,7 +670,7 @@ async def login(credentials: UserLogin, response: Response):
 async def forgot_password(payload: ForgotPasswordRequest):
     """
     Toujours renvoyer un message générique pour éviter l'énumération des emails.
-    En local/dev, on renvoie aussi le token/lien pour faciliter les tests.
+    En local/dev sans SMTP configuré, on renvoie aussi le token/lien pour faciliter les tests.
     """
     generic_message = "Si cet email existe, un lien de réinitialisation a été généré."
     user_doc = await db.users.find_one({"email": payload.email}, {"_id": 0})
@@ -622,9 +696,25 @@ async def forgot_password(payload: ForgotPasswordRequest):
     )
 
     reset_url = build_reset_password_url(raw_token)
-    logger.info("password-reset-link user_id=%s url=%s", user_doc["user_id"], reset_url)
+    if smtp_configured():
+        try:
+            await asyncio.to_thread(
+                send_password_reset_email_sync,
+                to_email=user_doc.get("email", ""),
+                to_name=user_doc.get("name"),
+                reset_url=reset_url,
+            )
+        except Exception:
+            # Ne pas leak d'info côté client (email enum). Journaliser côté serveur.
+            logger.exception("password-reset-email-send-failed user_id=%s", user_doc["user_id"])
+    else:
+        logger.warning(
+            "SMTP non configuré : reset link en logs uniquement user_id=%s url=%s",
+            user_doc["user_id"],
+            reset_url,
+        )
 
-    if _app_env != "production":
+    if _app_env != "production" and not smtp_configured():
         return {
             "message": generic_message,
             "reset_token": raw_token,

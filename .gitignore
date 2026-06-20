@@ -9,3 +9,4 @@ venv/
 uploads/
 *.log
 .DS_Store
+password_reset.config.local.json

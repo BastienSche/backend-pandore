@@ -5,10 +5,17 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 import os
 import logging
+import json
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from typing import Any, List, Optional, Literal
 import uuid
+import secrets
+import hashlib
+import smtplib
+import ssl
+from email.message import EmailMessage
+from email.utils import formataddr
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
@@ -86,6 +93,40 @@ GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
 GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
 FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
+PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
+
+def _load_password_reset_config() -> dict:
+    cfg = {}
+    candidates = [
+        ROOT_DIR / "password_reset.config.json",
+        ROOT_DIR / "password_reset.config.local.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg.update(raw)
+        except Exception:
+            logging.getLogger(__name__).exception("Impossible de lire la config reset password: %s", path)
+    return cfg
+
+PASSWORD_RESET_CONFIG = _load_password_reset_config()
+PASSWORD_RESET_SMTP = PASSWORD_RESET_CONFIG.get("smtp") if isinstance(PASSWORD_RESET_CONFIG.get("smtp"), dict) else {}
+
+FRONTEND_RESET_PASSWORD_URL = str(PASSWORD_RESET_CONFIG.get("frontend_reset_password_url") or "").strip().rstrip("/")
+PASSWORD_RESET_TOKEN_TTL_MINUTES = int(PASSWORD_RESET_CONFIG.get("token_ttl_minutes") or 30)
+
+# SMTP / email (forgot password) depuis password_reset.config*.json
+SMTP_HOST = str(PASSWORD_RESET_SMTP.get("host") or "").strip()
+SMTP_PORT = int(PASSWORD_RESET_SMTP.get("port") or 587)
+SMTP_USERNAME = str(PASSWORD_RESET_SMTP.get("username") or "").strip()
+SMTP_PASSWORD = str(PASSWORD_RESET_SMTP.get("password") or "")
+SMTP_FROM_EMAIL = str(PASSWORD_RESET_SMTP.get("from_email") or "").strip()
+SMTP_FROM_NAME = str(PASSWORD_RESET_SMTP.get("from_name") or "Kloud").strip()
+SMTP_REPLY_TO = str(PASSWORD_RESET_SMTP.get("reply_to") or "").strip()
+SMTP_USE_TLS = str(PASSWORD_RESET_SMTP.get("use_tls", True)).strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -214,6 +255,13 @@ class GoogleSessionResponse(BaseModel):
     name: str
     picture: Optional[str]
     session_token: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=6)
 
 class TrackCreate(BaseModel):
     title: str
@@ -447,6 +495,58 @@ def create_jwt_token(user_id: str) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+def hash_reset_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+def build_reset_password_url(raw_token: str) -> str:
+    if FRONTEND_RESET_PASSWORD_URL:
+        base = FRONTEND_RESET_PASSWORD_URL
+    elif PUBLIC_FRONTEND_URL:
+        base = f"{PUBLIC_FRONTEND_URL}/reset-password"
+    else:
+        # fallback local dev
+        base = "http://localhost:3000/reset-password"
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}token={raw_token}"
+
+def smtp_configured() -> bool:
+    return bool(SMTP_HOST and SMTP_FROM_EMAIL)
+
+def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+    subject = "Réinitialisation de votre mot de passe Kloud"
+    recipient_name = (to_name or "").strip() or "there"
+    plain_text = (
+        f"Bonjour {recipient_name},\n\n"
+        "Nous avons reçu une demande de réinitialisation de mot de passe.\n"
+        f"Ouvrir ce lien (valide {PASSWORD_RESET_TOKEN_TTL_MINUTES} minutes) :\n{reset_url}\n\n"
+        "Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.\n\n"
+        "— Kloud"
+    )
+    html = (
+        f"<p>Bonjour {recipient_name},</p>"
+        "<p>Nous avons reçu une demande de réinitialisation de mot de passe.</p>"
+        f"<p><a href=\"{reset_url}\">Réinitialiser mon mot de passe</a></p>"
+        f"<p>Ce lien est valide <strong>{PASSWORD_RESET_TOKEN_TTL_MINUTES} minutes</strong>.</p>"
+        "<p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>"
+        "<p>— Kloud</p>"
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = formataddr((SMTP_FROM_NAME, SMTP_FROM_EMAIL))
+    msg["To"] = to_email
+    if SMTP_REPLY_TO:
+        msg["Reply-To"] = SMTP_REPLY_TO
+    msg.set_content(plain_text)
+    msg.add_alternative(html, subtype="html")
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+        if SMTP_USE_TLS:
+            smtp.starttls(context=ssl.create_default_context())
+        if SMTP_USERNAME:
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+        smtp.send_message(msg)
+
 def ensure_google_oauth_configured():
     if not GOOGLE_OAUTH_CLIENT_ID or not GOOGLE_OAUTH_CLIENT_SECRET or not GOOGLE_OAUTH_REDIRECT_URI:
         raise HTTPException(status_code=500, detail="Google OAuth is not configured")
@@ -565,6 +665,102 @@ async def login(credentials: UserLogin, response: Response):
         "token": token,
         "user": UserResponse(**user_doc)
     }
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordRequest):
+    """
+    Toujours renvoyer un message générique pour éviter l'énumération des emails.
+    En local/dev sans SMTP configuré, on renvoie aussi le token/lien pour faciliter les tests.
+    """
+    generic_message = "Si cet email existe, un lien de réinitialisation a été généré."
+    user_doc = await db.users.find_one({"email": payload.email}, {"_id": 0})
+    if not user_doc:
+        return {"message": generic_message}
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hash_reset_token(raw_token)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=PASSWORD_RESET_TOKEN_TTL_MINUTES)
+
+    # Invalide les anciens tokens non utilisés pour ce compte
+    await db.password_reset_tokens.delete_many({"user_id": user_doc["user_id"], "used_at": None})
+    await db.password_reset_tokens.insert_one(
+        {
+            "token_hash": token_hash,
+            "user_id": user_doc["user_id"],
+            "email": user_doc.get("email"),
+            "created_at": now.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "used_at": None,
+        }
+    )
+
+    reset_url = build_reset_password_url(raw_token)
+    if smtp_configured():
+        try:
+            await asyncio.to_thread(
+                send_password_reset_email_sync,
+                to_email=user_doc.get("email", ""),
+                to_name=user_doc.get("name"),
+                reset_url=reset_url,
+            )
+        except Exception:
+            # Ne pas leak d'info côté client (email enum). Journaliser côté serveur.
+            logger.exception("password-reset-email-send-failed user_id=%s", user_doc["user_id"])
+    else:
+        logger.warning(
+            "SMTP non configuré : reset link en logs uniquement user_id=%s url=%s",
+            user_doc["user_id"],
+            reset_url,
+        )
+
+    if _app_env != "production" and not smtp_configured():
+        return {
+            "message": generic_message,
+            "reset_token": raw_token,
+            "reset_url": reset_url,
+            "expires_in_minutes": PASSWORD_RESET_TOKEN_TTL_MINUTES,
+        }
+    return {"message": generic_message}
+
+@api_router.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordRequest):
+    token_hash = hash_reset_token(payload.token)
+    token_doc = await db.password_reset_tokens.find_one({"token_hash": token_hash, "used_at": None}, {"_id": 0})
+    if not token_doc:
+        raise HTTPException(status_code=400, detail="Token invalide ou expiré")
+
+    expires_at = token_doc.get("expires_at")
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if not expires_at:
+        raise HTTPException(status_code=400, detail="Token invalide ou expiré")
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        await db.password_reset_tokens.update_one(
+            {"token_hash": token_hash},
+            {"$set": {"used_at": datetime.now(timezone.utc).isoformat()}},
+        )
+        raise HTTPException(status_code=400, detail="Token invalide ou expiré")
+
+    user_doc = await db.users.find_one({"user_id": token_doc["user_id"]}, {"_id": 0})
+    if not user_doc:
+        raise HTTPException(status_code=400, detail="Token invalide ou expiré")
+
+    new_hash = hash_password(payload.new_password)
+    await db.users.update_one(
+        {"user_id": user_doc["user_id"]},
+        {"$set": {"password_hash": new_hash}},
+    )
+    await db.password_reset_tokens.update_one(
+        {"token_hash": token_hash},
+        {"$set": {"used_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    # Invalide les sessions OAuth éventuelles
+    await db.user_sessions.delete_many({"user_id": user_doc["user_id"]})
+
+    return {"message": "Mot de passe réinitialisé avec succès"}
 
 @api_router.get("/auth/google/login")
 async def google_login():

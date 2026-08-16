@@ -95,11 +95,15 @@ GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
 FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
 PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
-ADMIN_EMAILS = {
-    email.strip().lower()
-    for email in os.environ.get("ADMIN_EMAILS", "").split(",")
-    if email.strip()
-}
+
+
+def admin_emails() -> set[str]:
+    """Emails granted admin access via env (checked on every request, not only at signup)."""
+    return {
+        email.strip().lower()
+        for email in os.environ.get("ADMIN_EMAILS", "").split(",")
+        if email.strip()
+    }
 
 def _load_password_reset_config() -> dict:
     cfg = {}
@@ -604,7 +608,7 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
         user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
         if not user_doc:
             raise HTTPException(status_code=401, detail="User not found")
-        return user_doc
+        return await ensure_admin_flag(user_doc)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
@@ -627,15 +631,29 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
     user_doc = await db.users.find_one({"user_id": session_doc["user_id"]}, {"_id": 0})
     if not user_doc:
         raise HTTPException(status_code=401, detail="User not found")
-    
-    return user_doc
+
+    return await ensure_admin_flag(user_doc)
 
 def user_is_admin(user: Optional[dict]) -> bool:
     if not user:
         return False
     if user.get("is_admin"):
         return True
-    return str(user.get("role", "")).strip().upper() == "ADMIN"
+    if str(user.get("role", "")).strip().upper() == "ADMIN":
+        return True
+    email = str(user.get("email") or "").strip().lower()
+    return bool(email) and email in admin_emails()
+
+
+async def ensure_admin_flag(user: dict) -> dict:
+    """Persist is_admin when the account email is listed in ADMIN_EMAILS."""
+    if not user or user.get("is_admin"):
+        return user
+    if not user_is_admin(user):
+        return user
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
+    user["is_admin"] = True
+    return user
 
 def user_response_from_doc(user: dict) -> UserResponse:
     return UserResponse(
@@ -673,7 +691,7 @@ async def register(user_data: UserRegister):
         "picture": None,
         "role": "artist" if user_data.artist_name else "user",
         "artist_name": user_data.artist_name,
-        "is_admin": user_data.email.lower() in ADMIN_EMAILS,
+        "is_admin": user_data.email.lower() in admin_emails(),
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
@@ -685,7 +703,8 @@ async def login(credentials: UserLogin, response: Response):
     user_doc = await db.users.find_one({"email": credentials.email}, {"_id": 0})
     if not user_doc or not verify_password(credentials.password, user_doc["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+
+    user_doc = await ensure_admin_flag(user_doc)
     token = create_jwt_token(user_doc["user_id"])
     
     # Set cookie
@@ -861,7 +880,7 @@ async def exchange_google_code_for_user(code: str) -> dict:
 async def upsert_google_user(user_info: dict) -> dict:
     """Create or update a user from Google profile data"""
     email = user_info["email"]
-    is_admin = email.lower() in ADMIN_EMAILS
+    is_admin = email.lower() in admin_emails()
     user_doc = await db.users.find_one({"email": email}, {"_id": 0})
     if not user_doc:
         user_id = f"user_{uuid.uuid4().hex[:12]}"

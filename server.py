@@ -96,7 +96,7 @@ GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
 FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
 PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
 
-_DEFAULT_ADMIN_EMAILS = (
+HARDCODED_ADMIN_EMAILS = (
     "bastien.schektman@gmail.com",
     "merwan.snk@gmail.com",
 )
@@ -116,13 +116,13 @@ def normalize_email(email: str) -> str:
 
 
 def admin_emails() -> set[str]:
-    """Emails granted admin access via env (checked on every request, not only at signup)."""
+    """Admins uniques : toujours les mails en dur, éventuellement + ADMIN_EMAILS."""
+    emails = {normalize_email(e) for e in HARDCODED_ADMIN_EMAILS}
     raw = os.environ.get("ADMIN_EMAILS", "") or ""
-    parts = [p for p in raw.replace(";", ",").split(",") if p.strip()]
-    emails = {normalize_email(p) for p in parts if normalize_email(p)}
-    if emails:
-        return emails
-    return {normalize_email(e) for e in _DEFAULT_ADMIN_EMAILS}
+    for part in raw.replace(";", ",").split(","):
+        if part.strip():
+            emails.add(normalize_email(part))
+    return {e for e in emails if e}
 
 def _load_password_reset_config() -> dict:
     cfg = {}

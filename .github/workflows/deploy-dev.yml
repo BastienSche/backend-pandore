@@ -25,6 +25,8 @@ jobs:
           script: |
             set -e
             cd ${{ secrets.VPS_APP_DIR }}
+            exec 9>/tmp/snk-kloud-compose.lock
+            flock -w 600 9
 
             if [ ! -d backend-pandore-dev/.git ]; then
               git clone --branch develop --single-branch https://github.com/BastienSche/backend-pandore.git backend-pandore-dev
@@ -42,9 +44,10 @@ jobs:
               git -C frontend-pandore-dev reset --hard origin/develop
             fi
 
-            docker compose up -d --build --no-deps backend_dev frontend_dev caddy
+            docker compose stop backend_dev frontend_dev || true
+            docker compose rm -f backend_dev frontend_dev || true
+            docker compose up -d --build --remove-orphans --no-deps backend_dev frontend_dev caddy
 
-            # Keep legacy prod folders up to date for transition safety.
             if [ -d backend-pandore/.git ]; then
               git -C backend-pandore fetch origin
               git -C backend-pandore checkout main

@@ -25,6 +25,8 @@ jobs:
           script: |
             set -e
             cd ${{ secrets.VPS_APP_DIR }}
+            exec 9>/tmp/snk-kloud-compose.lock
+            flock -w 600 9
 
             if [ ! -d backend-pandore-prod/.git ]; then
               git clone --branch main --single-branch https://github.com/BastienSche/backend-pandore.git backend-pandore-prod
@@ -42,9 +44,12 @@ jobs:
               git -C frontend-pandore-prod reset --hard origin/main
             fi
 
-            docker compose up -d --build --no-deps backend frontend caddy
+            # Avoid "No such container" when two repos deploy at once:
+            # stop/rm by service name, then recreate. Caddy stays up.
+            docker compose stop backend frontend || true
+            docker compose rm -f backend frontend || true
+            docker compose up -d --build --remove-orphans --no-deps backend frontend caddy
 
-            # Keep legacy folders in sync during migration.
             if [ -d backend-pandore/.git ]; then
               git -C backend-pandore fetch origin
               git -C backend-pandore checkout main

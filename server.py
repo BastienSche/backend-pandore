@@ -6,6 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 import os
 import logging
 import json
+import re
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from typing import Any, List, Optional, Literal
@@ -1581,6 +1582,143 @@ async def update_artist_profile(profile_data: ArtistProfileCreate, authorization
 
 # ==================== UPLOAD ROUTES ====================
 
+_AUDIO_CHUNK_SIZE = 256 * 1024
+_RANGE_RE = re.compile(r"bytes\s*=\s*(\d*)\s*-\s*(\d*)", re.IGNORECASE)
+_WAV_CONTENT_TYPES = {
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+    "audio/vnd.wave",
+    "audio/x-pn-wav",
+}
+
+
+def _sniff_audio_content_type(header: bytes) -> Optional[str]:
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE":
+        return "audio/wav"
+    if header[:3] == b"ID3":
+        return "audio/mpeg"
+    if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
+        return "audio/mpeg"
+    if header[:4] == b"fLaC":
+        return "audio/flac"
+    if header[:4] == b"OggS":
+        return "audio/ogg"
+    if len(header) >= 12 and header[4:8] == b"ftyp":
+        return "audio/mp4"
+    return None
+
+
+def _normalize_audio_content_type(
+    content_type: Optional[str],
+    filename: Optional[str] = None,
+    header: Optional[bytes] = None,
+) -> str:
+    sniffed = _sniff_audio_content_type(header) if header else None
+    if sniffed:
+        return sniffed
+
+    ct = (content_type or "").split(";")[0].strip().lower()
+    fn = (filename or "").lower()
+
+    if ct in _WAV_CONTENT_TYPES or fn.endswith((".wav", ".wave")):
+        return "audio/wav"
+    if ct in {"audio/mpeg", "audio/mp3", "audio/x-mpeg", "audio/x-mp3"} or fn.endswith((".mp3", ".mpga")):
+        return "audio/mpeg"
+    if ct in {"audio/flac", "audio/x-flac"} or fn.endswith(".flac"):
+        return "audio/flac"
+    if ct in {"audio/ogg", "audio/vorbis", "application/ogg"} or fn.endswith((".ogg", ".oga")):
+        return "audio/ogg"
+    if ct in {"audio/mp4", "audio/aac", "audio/x-m4a", "audio/m4a"} or fn.endswith((".m4a", ".aac", ".mp4")):
+        return "audio/mp4"
+    if ct.startswith("audio/"):
+        return ct
+    return ct or "application/octet-stream"
+
+
+def _safe_audio_filename(filename: Optional[str], content_type: str) -> str:
+    name = (filename or "track").replace("\\", "/").split("/")[-1].replace('"', "").strip()
+    if name.lower().endswith(".wave"):
+        name = name[:-5] + ".wav"
+    if "." not in name:
+        ext = {
+            "audio/wav": ".wav",
+            "audio/mpeg": ".mp3",
+            "audio/flac": ".flac",
+            "audio/ogg": ".ogg",
+            "audio/mp4": ".m4a",
+        }.get(content_type, "")
+        name = f"{name or 'track'}{ext}"
+    return name or "track"
+
+
+def _parse_byte_range(range_header: str, file_size: int):
+    """Parse a single RFC 7233 range. Returns (start, end) inclusive, 'unsatisfiable', or None."""
+    if not range_header or file_size <= 0:
+        return None
+    first = range_header.split(",", 1)[0]
+    match = _RANGE_RE.search(first) or _RANGE_RE.search(range_header)
+    if not match:
+        return None
+    start_s, end_s = match.group(1), match.group(2)
+    if start_s == "" and end_s == "":
+        return None
+    try:
+        if start_s == "":
+            suffix = int(end_s)
+            if suffix <= 0:
+                return "unsatisfiable"
+            start = max(0, file_size - suffix)
+            return start, file_size - 1
+        start = int(start_s)
+        end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        return None
+    if start >= file_size or end < start:
+        return "unsatisfiable"
+    return start, min(end, file_size - 1)
+
+
+async def _seek_grid_out(grid_out, position: int) -> bool:
+    seek = getattr(grid_out, "seek", None)
+    if seek is None:
+        return False
+    try:
+        result = seek(position)
+        if hasattr(result, "__await__"):
+            await result
+        return True
+    except Exception:
+        return False
+
+
+async def _seek_grid_out_or_skip(grid_out, position: int) -> None:
+    if position <= 0:
+        return
+    if await _seek_grid_out(grid_out, position):
+        return
+    remaining = position
+    while remaining > 0:
+        chunk = await grid_out.read(min(_AUDIO_CHUNK_SIZE, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+
+
+def _audio_response_headers(content_type: str, filename: Optional[str], extra: Optional[dict] = None) -> dict:
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": content_type,
+        # no-transform: proxies (Caddy gzip) must not recode the stream — that breaks Range + WAV.
+        "Cache-Control": "public, max-age=86400, no-transform",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f'inline; filename="{_safe_audio_filename(filename, content_type)}"',
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 @api_router.post("/upload/audio")
 async def upload_audio(file: UploadFile = File(...), authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
@@ -1592,12 +1730,15 @@ async def upload_audio(file: UploadFile = File(...), authorization: Optional[str
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    filename = file.filename or f"{uuid.uuid4().hex}.audio"
+    content_type = _normalize_audio_content_type(file.content_type, filename, content[:16])
+
     file_id = await fs.upload_from_stream(
-        filename=file.filename or f"{uuid.uuid4().hex}.audio",
+        filename=filename,
         source=content,
         metadata={
             "kind": "audio",
-            "content_type": file.content_type or "application/octet-stream",
+            "content_type": content_type,
             "uploader_user_id": user["user_id"],
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
         },
@@ -1642,39 +1783,42 @@ async def get_audio_file(file_id: str, request: Request):
         raise HTTPException(status_code=404, detail="File not found")
 
     file_size = int(getattr(grid_out, "length", 0) or 0)
-    content_type = (
+    filename = getattr(grid_out, "filename", None) or ""
+    stored_type = (
         (getattr(grid_out, "metadata", None) or {}).get("content_type")
         or getattr(grid_out, "content_type", None)
-        or "application/octet-stream"
+        or ""
     )
+    content_type = _normalize_audio_content_type(stored_type, filename)
 
-    # Support range requests for audio preview/streaming
-    range_header = request.headers.get("range")
-    if range_header:
-        range_match = range_header.replace("bytes=", "").split("-")
-        start = int(range_match[0])
-        end = int(range_match[1]) if range_match[1] else file_size - 1
+    # Existing .wave uploads often stored audio/wave or octet-stream — sniff if still generic.
+    if content_type in {"application/octet-stream", "audio/wave", ""} or not str(content_type).startswith("audio/"):
+        if await _seek_grid_out(grid_out, 0):
+            try:
+                header = await grid_out.read(16)
+                content_type = _normalize_audio_content_type(stored_type, filename, header)
+            finally:
+                await _seek_grid_out(grid_out, 0)
 
-        if file_size <= 0:
-            raise HTTPException(status_code=416, detail="Invalid range")
-        if start < 0 or end < start or end >= file_size:
-            raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable")
+    parsed = _parse_byte_range(request.headers.get("range") or "", file_size)
+    if parsed == "unsatisfiable":
+        return Response(
+            status_code=416,
+            headers=_audio_response_headers(
+                content_type,
+                filename,
+                {"Content-Range": f"bytes */{file_size}"},
+            ),
+        )
+
+    if parsed:
+        start, end = parsed
 
         async def iterfile():
-            # Try to seek efficiently if supported; otherwise discard bytes.
             remaining = end - start + 1
-            try:
-                await grid_out.seek(start)  # type: ignore[attr-defined]
-            except Exception:
-                to_discard = start
-                while to_discard > 0:
-                    chunk = await grid_out.read(min(8192, to_discard))
-                    if not chunk:
-                        break
-                    to_discard -= len(chunk)
-
+            await _seek_grid_out_or_skip(grid_out, start)
             while remaining > 0:
-                data = await grid_out.read(min(8192, remaining))
+                data = await grid_out.read(min(_AUDIO_CHUNK_SIZE, remaining))
                 if not data:
                     break
                 remaining -= len(data)
@@ -1683,28 +1827,32 @@ async def get_audio_file(file_id: str, request: Request):
         return StreamingResponse(
             iterfile(),
             status_code=206,
-            headers={
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(end - start + 1),
-                "Content-Type": content_type,
-            }
+            media_type=content_type,
+            headers=_audio_response_headers(
+                content_type,
+                filename,
+                {
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                    "Content-Length": str(end - start + 1),
+                },
+            ),
         )
 
     async def iterfile_full():
         while True:
-            data = await grid_out.read(8192)
+            data = await grid_out.read(_AUDIO_CHUNK_SIZE)
             if not data:
                 break
             yield data
 
     return StreamingResponse(
         iterfile_full(),
-        headers={
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(file_size),
-            "Content-Type": content_type,
-        },
+        media_type=content_type,
+        headers=_audio_response_headers(
+            content_type,
+            filename,
+            {"Content-Length": str(file_size)},
+        ),
     )
 
 @api_router.get("/files/covers/{file_id}")

@@ -6,6 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 import os
 import logging
 import json
+import re
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from typing import Any, List, Optional, Literal
@@ -94,6 +95,29 @@ GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
 FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
 PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
+
+HARDCODED_ADMIN_EMAILS = (
+    "bastien.schektman@gmail.com",
+    "merwan.snk@gmail.com",
+)
+
+
+def normalize_email(email: str) -> str:
+    """Lowercase, strip quotes, and treat Gmail dots/+tags as the same mailbox."""
+    raw = str(email or "").strip().strip("\"'").lower()
+    if "@" not in raw:
+        return raw
+    local, _, domain = raw.partition("@")
+    domain = domain.strip()
+    if domain in {"gmail.com", "googlemail.com"}:
+        local = local.split("+", 1)[0].replace(".", "")
+        domain = "gmail.com"
+    return f"{local}@{domain}"
+
+
+def admin_emails() -> set[str]:
+    """Seuls ces deux mails ont accès admin — liste figée dans le code."""
+    return {normalize_email(e) for e in HARDCODED_ADMIN_EMAILS}
 
 def _load_password_reset_config() -> dict:
     cfg = {}
@@ -241,6 +265,7 @@ class UserResponse(BaseModel):
     role: str
     artist_name: Optional[str] = None
     created_at: str
+    is_admin: bool = False
 
 class GoogleSessionRequest(BaseModel):
     session_id: str
@@ -597,7 +622,7 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
         user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
         if not user_doc:
             raise HTTPException(status_code=401, detail="User not found")
-        return user_doc
+        return await ensure_admin_flag(user_doc)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
@@ -620,12 +645,39 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
     user_doc = await db.users.find_one({"user_id": session_doc["user_id"]}, {"_id": 0})
     if not user_doc:
         raise HTTPException(status_code=401, detail="User not found")
-    
-    return user_doc
+
+    return await ensure_admin_flag(user_doc)
+
+def user_is_admin(user: Optional[dict]) -> bool:
+    if not user:
+        return False
+    return normalize_email(user.get("email") or "") in admin_emails()
+
+
+async def ensure_admin_flag(user: dict) -> dict:
+    """Persist is_admin when the account email is listed in ADMIN_EMAILS."""
+    if not user or user.get("is_admin"):
+        return user
+    if not user_is_admin(user):
+        return user
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
+    user["is_admin"] = True
+    return user
+
+def user_response_from_doc(user: dict) -> UserResponse:
+    return UserResponse(
+        user_id=user["user_id"],
+        email=user["email"],
+        name=user.get("name", ""),
+        picture=user.get("picture"),
+        role=user.get("role", "user"),
+        artist_name=user.get("artist_name"),
+        created_at=user.get("created_at", ""),
+        is_admin=user_is_admin(user),
+    )
 
 def require_admin(user: dict) -> None:
-    role = str((user or {}).get("role", "")).strip().upper()
-    if role != "ADMIN":
+    if not user_is_admin(user):
         raise HTTPException(status_code=403, detail="Admin only")
 
 # ==================== AUTH ROUTES ====================
@@ -648,18 +700,39 @@ async def register(user_data: UserRegister):
         "picture": None,
         "role": "artist" if user_data.artist_name else "user",
         "artist_name": user_data.artist_name,
+        "is_admin": normalize_email(user_data.email) in admin_emails(),
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
     await db.users.insert_one(user_doc)
-    return UserResponse(**user_doc)
+    return user_response_from_doc(user_doc)
+
+async def find_user_by_email(email: str) -> Optional[dict]:
+    raw = str(email or "").strip()
+    if not raw:
+        return None
+    doc = await db.users.find_one(
+        {"email": {"$regex": f"^{re.escape(raw)}$", "$options": "i"}},
+        {"_id": 0},
+    )
+    if doc:
+        return doc
+    target = normalize_email(raw)
+    cursor = db.users.find({}, {"_id": 0, "password_hash": 0})
+    async for user in cursor:
+        if normalize_email(user.get("email") or "") == target:
+            full = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+            return full
+    return None
+
 
 @api_router.post("/auth/login")
 async def login(credentials: UserLogin, response: Response):
-    user_doc = await db.users.find_one({"email": credentials.email}, {"_id": 0})
-    if not user_doc or not verify_password(credentials.password, user_doc["password_hash"]):
+    user_doc = await find_user_by_email(str(credentials.email))
+    if not user_doc or not user_doc.get("password_hash") or not verify_password(credentials.password, user_doc["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+
+    user_doc = await ensure_admin_flag(user_doc)
     token = create_jwt_token(user_doc["user_id"])
     
     # Set cookie
@@ -675,7 +748,7 @@ async def login(credentials: UserLogin, response: Response):
     
     return {
         "token": token,
-        "user": UserResponse(**user_doc)
+        "user": user_response_from_doc(user_doc)
     }
 
 @api_router.post("/auth/forgot-password")
@@ -834,29 +907,36 @@ async def exchange_google_code_for_user(code: str) -> dict:
 
 async def upsert_google_user(user_info: dict) -> dict:
     """Create or update a user from Google profile data"""
-    user_doc = await db.users.find_one({"email": user_info["email"]}, {"_id": 0})
+    email = user_info["email"]
+    is_admin = normalize_email(email) in admin_emails()
+    user_doc = await db.users.find_one({"email": email}, {"_id": 0})
     if not user_doc:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         user_doc = {
             "user_id": user_id,
-            "email": user_info["email"],
+            "email": email,
             "password_hash": None,
             "name": user_info.get("name") or user_info.get("given_name") or "",
             "picture": user_info.get("picture"),
             "role": "user",
             "artist_name": None,
+            "is_admin": is_admin,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await db.users.insert_one(user_doc)
     else:
         user_id = user_doc["user_id"]
+        update_fields = {
+            "name": user_info.get("name") or user_info.get("given_name") or user_doc.get("name"),
+            "picture": user_info.get("picture"),
+        }
+        if is_admin:
+            update_fields["is_admin"] = True
         await db.users.update_one(
             {"user_id": user_id},
-            {"$set": {
-                "name": user_info.get("name") or user_info.get("given_name") or user_doc.get("name"),
-                "picture": user_info.get("picture"),
-            }},
+            {"$set": update_fields},
         )
+        user_doc.update(update_fields)
     user_doc["user_id"] = user_id
     return user_doc
 
@@ -959,7 +1039,7 @@ async def google_callback_api(
 @api_router.get("/auth/me", response_model=UserResponse)
 async def get_me(authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
-    return UserResponse(**user)
+    return user_response_from_doc(user)
 
 # ==================== USER SETTINGS ROUTES ====================
 
@@ -1017,11 +1097,12 @@ async def update_role(new_role: str, artist_name: Optional[str] = None, authoriz
         {"user_id": user["user_id"]},
         {"$set": {
             "role": new_role,
-            "artist_name": artist_name if new_role == "artist" else user.get("artist_name")
+            "artist_name": artist_name if new_role == "artist" else user.get("artist_name"),
+            "is_admin": user_is_admin(user),
         }}
     )
     
-    return {"role": new_role, "artist_name": artist_name}
+    return {"role": new_role, "artist_name": artist_name, "is_admin": user_is_admin(user)}
 
 # ==================== ADMIN ROUTES ====================
 
@@ -1548,6 +1629,143 @@ async def update_artist_profile(profile_data: ArtistProfileCreate, authorization
 
 # ==================== UPLOAD ROUTES ====================
 
+_AUDIO_CHUNK_SIZE = 256 * 1024
+_RANGE_RE = re.compile(r"bytes\s*=\s*(\d*)\s*-\s*(\d*)", re.IGNORECASE)
+_WAV_CONTENT_TYPES = {
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+    "audio/vnd.wave",
+    "audio/x-pn-wav",
+}
+
+
+def _sniff_audio_content_type(header: bytes) -> Optional[str]:
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE":
+        return "audio/wav"
+    if header[:3] == b"ID3":
+        return "audio/mpeg"
+    if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
+        return "audio/mpeg"
+    if header[:4] == b"fLaC":
+        return "audio/flac"
+    if header[:4] == b"OggS":
+        return "audio/ogg"
+    if len(header) >= 12 and header[4:8] == b"ftyp":
+        return "audio/mp4"
+    return None
+
+
+def _normalize_audio_content_type(
+    content_type: Optional[str],
+    filename: Optional[str] = None,
+    header: Optional[bytes] = None,
+) -> str:
+    sniffed = _sniff_audio_content_type(header) if header else None
+    if sniffed:
+        return sniffed
+
+    ct = (content_type or "").split(";")[0].strip().lower()
+    fn = (filename or "").lower()
+
+    if ct in _WAV_CONTENT_TYPES or fn.endswith((".wav", ".wave")):
+        return "audio/wav"
+    if ct in {"audio/mpeg", "audio/mp3", "audio/x-mpeg", "audio/x-mp3"} or fn.endswith((".mp3", ".mpga")):
+        return "audio/mpeg"
+    if ct in {"audio/flac", "audio/x-flac"} or fn.endswith(".flac"):
+        return "audio/flac"
+    if ct in {"audio/ogg", "audio/vorbis", "application/ogg"} or fn.endswith((".ogg", ".oga")):
+        return "audio/ogg"
+    if ct in {"audio/mp4", "audio/aac", "audio/x-m4a", "audio/m4a"} or fn.endswith((".m4a", ".aac", ".mp4")):
+        return "audio/mp4"
+    if ct.startswith("audio/"):
+        return ct
+    return ct or "application/octet-stream"
+
+
+def _safe_audio_filename(filename: Optional[str], content_type: str) -> str:
+    name = (filename or "track").replace("\\", "/").split("/")[-1].replace('"', "").strip()
+    if name.lower().endswith(".wave"):
+        name = name[:-5] + ".wav"
+    if "." not in name:
+        ext = {
+            "audio/wav": ".wav",
+            "audio/mpeg": ".mp3",
+            "audio/flac": ".flac",
+            "audio/ogg": ".ogg",
+            "audio/mp4": ".m4a",
+        }.get(content_type, "")
+        name = f"{name or 'track'}{ext}"
+    return name or "track"
+
+
+def _parse_byte_range(range_header: str, file_size: int):
+    """Parse a single RFC 7233 range. Returns (start, end) inclusive, 'unsatisfiable', or None."""
+    if not range_header or file_size <= 0:
+        return None
+    first = range_header.split(",", 1)[0]
+    match = _RANGE_RE.search(first) or _RANGE_RE.search(range_header)
+    if not match:
+        return None
+    start_s, end_s = match.group(1), match.group(2)
+    if start_s == "" and end_s == "":
+        return None
+    try:
+        if start_s == "":
+            suffix = int(end_s)
+            if suffix <= 0:
+                return "unsatisfiable"
+            start = max(0, file_size - suffix)
+            return start, file_size - 1
+        start = int(start_s)
+        end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        return None
+    if start >= file_size or end < start:
+        return "unsatisfiable"
+    return start, min(end, file_size - 1)
+
+
+async def _seek_grid_out(grid_out, position: int) -> bool:
+    seek = getattr(grid_out, "seek", None)
+    if seek is None:
+        return False
+    try:
+        result = seek(position)
+        if hasattr(result, "__await__"):
+            await result
+        return True
+    except Exception:
+        return False
+
+
+async def _seek_grid_out_or_skip(grid_out, position: int) -> None:
+    if position <= 0:
+        return
+    if await _seek_grid_out(grid_out, position):
+        return
+    remaining = position
+    while remaining > 0:
+        chunk = await grid_out.read(min(_AUDIO_CHUNK_SIZE, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+
+
+def _audio_response_headers(content_type: str, filename: Optional[str], extra: Optional[dict] = None) -> dict:
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": content_type,
+        # no-transform: proxies (Caddy gzip) must not recode the stream — that breaks Range + WAV.
+        "Cache-Control": "public, max-age=86400, no-transform",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f'inline; filename="{_safe_audio_filename(filename, content_type)}"',
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 @api_router.post("/upload/audio")
 async def upload_audio(file: UploadFile = File(...), authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
@@ -1559,12 +1777,15 @@ async def upload_audio(file: UploadFile = File(...), authorization: Optional[str
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    filename = file.filename or f"{uuid.uuid4().hex}.audio"
+    content_type = _normalize_audio_content_type(file.content_type, filename, content[:16])
+
     file_id = await fs.upload_from_stream(
-        filename=file.filename or f"{uuid.uuid4().hex}.audio",
+        filename=filename,
         source=content,
         metadata={
             "kind": "audio",
-            "content_type": file.content_type or "application/octet-stream",
+            "content_type": content_type,
             "uploader_user_id": user["user_id"],
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
         },
@@ -1609,39 +1830,42 @@ async def get_audio_file(file_id: str, request: Request):
         raise HTTPException(status_code=404, detail="File not found")
 
     file_size = int(getattr(grid_out, "length", 0) or 0)
-    content_type = (
+    filename = getattr(grid_out, "filename", None) or ""
+    stored_type = (
         (getattr(grid_out, "metadata", None) or {}).get("content_type")
         or getattr(grid_out, "content_type", None)
-        or "application/octet-stream"
+        or ""
     )
+    content_type = _normalize_audio_content_type(stored_type, filename)
 
-    # Support range requests for audio preview/streaming
-    range_header = request.headers.get("range")
-    if range_header:
-        range_match = range_header.replace("bytes=", "").split("-")
-        start = int(range_match[0])
-        end = int(range_match[1]) if range_match[1] else file_size - 1
+    # Existing .wave uploads often stored audio/wave or octet-stream — sniff if still generic.
+    if content_type in {"application/octet-stream", "audio/wave", ""} or not str(content_type).startswith("audio/"):
+        if await _seek_grid_out(grid_out, 0):
+            try:
+                header = await grid_out.read(16)
+                content_type = _normalize_audio_content_type(stored_type, filename, header)
+            finally:
+                await _seek_grid_out(grid_out, 0)
 
-        if file_size <= 0:
-            raise HTTPException(status_code=416, detail="Invalid range")
-        if start < 0 or end < start or end >= file_size:
-            raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable")
+    parsed = _parse_byte_range(request.headers.get("range") or "", file_size)
+    if parsed == "unsatisfiable":
+        return Response(
+            status_code=416,
+            headers=_audio_response_headers(
+                content_type,
+                filename,
+                {"Content-Range": f"bytes */{file_size}"},
+            ),
+        )
+
+    if parsed:
+        start, end = parsed
 
         async def iterfile():
-            # Try to seek efficiently if supported; otherwise discard bytes.
             remaining = end - start + 1
-            try:
-                await grid_out.seek(start)  # type: ignore[attr-defined]
-            except Exception:
-                to_discard = start
-                while to_discard > 0:
-                    chunk = await grid_out.read(min(8192, to_discard))
-                    if not chunk:
-                        break
-                    to_discard -= len(chunk)
-
+            await _seek_grid_out_or_skip(grid_out, start)
             while remaining > 0:
-                data = await grid_out.read(min(8192, remaining))
+                data = await grid_out.read(min(_AUDIO_CHUNK_SIZE, remaining))
                 if not data:
                     break
                 remaining -= len(data)
@@ -1650,28 +1874,32 @@ async def get_audio_file(file_id: str, request: Request):
         return StreamingResponse(
             iterfile(),
             status_code=206,
-            headers={
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(end - start + 1),
-                "Content-Type": content_type,
-            }
+            media_type=content_type,
+            headers=_audio_response_headers(
+                content_type,
+                filename,
+                {
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                    "Content-Length": str(end - start + 1),
+                },
+            ),
         )
 
     async def iterfile_full():
         while True:
-            data = await grid_out.read(8192)
+            data = await grid_out.read(_AUDIO_CHUNK_SIZE)
             if not data:
                 break
             yield data
 
     return StreamingResponse(
         iterfile_full(),
-        headers={
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(file_size),
-            "Content-Type": content_type,
-        },
+        media_type=content_type,
+        headers=_audio_response_headers(
+            content_type,
+            filename,
+            {"Content-Length": str(file_size)},
+        ),
     )
 
 @api_router.get("/files/covers/{file_id}")
@@ -3270,6 +3498,24 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+@app.on_event("startup")
+async def sync_admin_emails_on_startup():
+    wanted = admin_emails()
+    logging.getLogger(__name__).info("ADMIN_EMAILS: %s", ", ".join(sorted(wanted)) or "(none)")
+    if not wanted:
+        return
+    updated = 0
+    cursor = db.users.find({}, {"_id": 0, "user_id": 1, "email": 1, "is_admin": 1})
+    async for user in cursor:
+        if user.get("is_admin"):
+            continue
+        if normalize_email(user.get("email") or "") in wanted:
+            await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
+            updated += 1
+    if updated:
+        logging.getLogger(__name__).info("Granted is_admin to %s existing user(s)", updated)
+
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

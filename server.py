@@ -116,13 +116,8 @@ def normalize_email(email: str) -> str:
 
 
 def admin_emails() -> set[str]:
-    """Admins uniques : toujours les mails en dur, éventuellement + ADMIN_EMAILS."""
-    emails = {normalize_email(e) for e in HARDCODED_ADMIN_EMAILS}
-    raw = os.environ.get("ADMIN_EMAILS", "") or ""
-    for part in raw.replace(";", ",").split(","):
-        if part.strip():
-            emails.add(normalize_email(part))
-    return {e for e in emails if e}
+    """Seuls ces deux mails ont accès admin — liste figée dans le code."""
+    return {normalize_email(e) for e in HARDCODED_ADMIN_EMAILS}
 
 def _load_password_reset_config() -> dict:
     cfg = {}
@@ -656,12 +651,7 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
 def user_is_admin(user: Optional[dict]) -> bool:
     if not user:
         return False
-    if user.get("is_admin"):
-        return True
-    if str(user.get("role", "")).strip().upper() == "ADMIN":
-        return True
-    email = str(user.get("email") or "").strip().lower()
-    return bool(email) and normalize_email(email) in admin_emails()
+    return normalize_email(user.get("email") or "") in admin_emails()
 
 
 async def ensure_admin_flag(user: dict) -> dict:

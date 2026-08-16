@@ -94,6 +94,11 @@ GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
 FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
 PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
+ADMIN_EMAILS = {
+    email.strip().lower()
+    for email in os.environ.get("ADMIN_EMAILS", "").split(",")
+    if email.strip()
+}
 
 def _load_password_reset_config() -> dict:
     cfg = {}
@@ -241,6 +246,7 @@ class UserResponse(BaseModel):
     role: str
     artist_name: Optional[str] = None
     created_at: str
+    is_admin: bool = False
 
 class GoogleSessionRequest(BaseModel):
     session_id: str
@@ -623,9 +629,27 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
     
     return user_doc
 
+def user_is_admin(user: Optional[dict]) -> bool:
+    if not user:
+        return False
+    if user.get("is_admin"):
+        return True
+    return str(user.get("role", "")).strip().upper() == "ADMIN"
+
+def user_response_from_doc(user: dict) -> UserResponse:
+    return UserResponse(
+        user_id=user["user_id"],
+        email=user["email"],
+        name=user.get("name", ""),
+        picture=user.get("picture"),
+        role=user.get("role", "user"),
+        artist_name=user.get("artist_name"),
+        created_at=user.get("created_at", ""),
+        is_admin=user_is_admin(user),
+    )
+
 def require_admin(user: dict) -> None:
-    role = str((user or {}).get("role", "")).strip().upper()
-    if role != "ADMIN":
+    if not user_is_admin(user):
         raise HTTPException(status_code=403, detail="Admin only")
 
 # ==================== AUTH ROUTES ====================
@@ -648,11 +672,12 @@ async def register(user_data: UserRegister):
         "picture": None,
         "role": "artist" if user_data.artist_name else "user",
         "artist_name": user_data.artist_name,
+        "is_admin": user_data.email.lower() in ADMIN_EMAILS,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
     await db.users.insert_one(user_doc)
-    return UserResponse(**user_doc)
+    return user_response_from_doc(user_doc)
 
 @api_router.post("/auth/login")
 async def login(credentials: UserLogin, response: Response):
@@ -675,7 +700,7 @@ async def login(credentials: UserLogin, response: Response):
     
     return {
         "token": token,
-        "user": UserResponse(**user_doc)
+        "user": user_response_from_doc(user_doc)
     }
 
 @api_router.post("/auth/forgot-password")
@@ -834,29 +859,36 @@ async def exchange_google_code_for_user(code: str) -> dict:
 
 async def upsert_google_user(user_info: dict) -> dict:
     """Create or update a user from Google profile data"""
-    user_doc = await db.users.find_one({"email": user_info["email"]}, {"_id": 0})
+    email = user_info["email"]
+    is_admin = email.lower() in ADMIN_EMAILS
+    user_doc = await db.users.find_one({"email": email}, {"_id": 0})
     if not user_doc:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         user_doc = {
             "user_id": user_id,
-            "email": user_info["email"],
+            "email": email,
             "password_hash": None,
             "name": user_info.get("name") or user_info.get("given_name") or "",
             "picture": user_info.get("picture"),
             "role": "user",
             "artist_name": None,
+            "is_admin": is_admin,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await db.users.insert_one(user_doc)
     else:
         user_id = user_doc["user_id"]
+        update_fields = {
+            "name": user_info.get("name") or user_info.get("given_name") or user_doc.get("name"),
+            "picture": user_info.get("picture"),
+        }
+        if is_admin:
+            update_fields["is_admin"] = True
         await db.users.update_one(
             {"user_id": user_id},
-            {"$set": {
-                "name": user_info.get("name") or user_info.get("given_name") or user_doc.get("name"),
-                "picture": user_info.get("picture"),
-            }},
+            {"$set": update_fields},
         )
+        user_doc.update(update_fields)
     user_doc["user_id"] = user_id
     return user_doc
 
@@ -959,7 +991,7 @@ async def google_callback_api(
 @api_router.get("/auth/me", response_model=UserResponse)
 async def get_me(authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
-    return UserResponse(**user)
+    return user_response_from_doc(user)
 
 # ==================== USER SETTINGS ROUTES ====================
 
@@ -1017,11 +1049,12 @@ async def update_role(new_role: str, artist_name: Optional[str] = None, authoriz
         {"user_id": user["user_id"]},
         {"$set": {
             "role": new_role,
-            "artist_name": artist_name if new_role == "artist" else user.get("artist_name")
+            "artist_name": artist_name if new_role == "artist" else user.get("artist_name"),
+            "is_admin": user_is_admin(user),
         }}
     )
     
-    return {"role": new_role, "artist_name": artist_name}
+    return {"role": new_role, "artist_name": artist_name, "is_admin": user_is_admin(user)}
 
 # ==================== ADMIN ROUTES ====================
 

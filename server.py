@@ -96,14 +96,33 @@ GOOGLE_OAUTH_REDIRECT_URI = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
 FRONTEND_OAUTH_REDIRECT_URL = os.environ.get("FRONTEND_OAUTH_REDIRECT_URL")
 PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
 
+_DEFAULT_ADMIN_EMAILS = (
+    "bastien.schektman@gmail.com",
+    "merwan.snk@gmail.com",
+)
+
+
+def normalize_email(email: str) -> str:
+    """Lowercase, strip quotes, and treat Gmail dots/+tags as the same mailbox."""
+    raw = str(email or "").strip().strip("\"'").lower()
+    if "@" not in raw:
+        return raw
+    local, _, domain = raw.partition("@")
+    domain = domain.strip()
+    if domain in {"gmail.com", "googlemail.com"}:
+        local = local.split("+", 1)[0].replace(".", "")
+        domain = "gmail.com"
+    return f"{local}@{domain}"
+
 
 def admin_emails() -> set[str]:
     """Emails granted admin access via env (checked on every request, not only at signup)."""
-    return {
-        email.strip().lower()
-        for email in os.environ.get("ADMIN_EMAILS", "").split(",")
-        if email.strip()
-    }
+    raw = os.environ.get("ADMIN_EMAILS", "") or ""
+    parts = [p for p in raw.replace(";", ",").split(",") if p.strip()]
+    emails = {normalize_email(p) for p in parts if normalize_email(p)}
+    if emails:
+        return emails
+    return {normalize_email(e) for e in _DEFAULT_ADMIN_EMAILS}
 
 def _load_password_reset_config() -> dict:
     cfg = {}
@@ -642,7 +661,7 @@ def user_is_admin(user: Optional[dict]) -> bool:
     if str(user.get("role", "")).strip().upper() == "ADMIN":
         return True
     email = str(user.get("email") or "").strip().lower()
-    return bool(email) and email in admin_emails()
+    return bool(email) and normalize_email(email) in admin_emails()
 
 
 async def ensure_admin_flag(user: dict) -> dict:
@@ -691,17 +710,36 @@ async def register(user_data: UserRegister):
         "picture": None,
         "role": "artist" if user_data.artist_name else "user",
         "artist_name": user_data.artist_name,
-        "is_admin": user_data.email.lower() in admin_emails(),
+        "is_admin": normalize_email(user_data.email) in admin_emails(),
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
     await db.users.insert_one(user_doc)
     return user_response_from_doc(user_doc)
 
+async def find_user_by_email(email: str) -> Optional[dict]:
+    raw = str(email or "").strip()
+    if not raw:
+        return None
+    doc = await db.users.find_one(
+        {"email": {"$regex": f"^{re.escape(raw)}$", "$options": "i"}},
+        {"_id": 0},
+    )
+    if doc:
+        return doc
+    target = normalize_email(raw)
+    cursor = db.users.find({}, {"_id": 0, "password_hash": 0})
+    async for user in cursor:
+        if normalize_email(user.get("email") or "") == target:
+            full = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+            return full
+    return None
+
+
 @api_router.post("/auth/login")
 async def login(credentials: UserLogin, response: Response):
-    user_doc = await db.users.find_one({"email": credentials.email}, {"_id": 0})
-    if not user_doc or not verify_password(credentials.password, user_doc["password_hash"]):
+    user_doc = await find_user_by_email(str(credentials.email))
+    if not user_doc or not user_doc.get("password_hash") or not verify_password(credentials.password, user_doc["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user_doc = await ensure_admin_flag(user_doc)
@@ -880,7 +918,7 @@ async def exchange_google_code_for_user(code: str) -> dict:
 async def upsert_google_user(user_info: dict) -> dict:
     """Create or update a user from Google profile data"""
     email = user_info["email"]
-    is_admin = email.lower() in admin_emails()
+    is_admin = normalize_email(email) in admin_emails()
     user_doc = await db.users.find_one({"email": email}, {"_id": 0})
     if not user_doc:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
@@ -3470,6 +3508,24 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+@app.on_event("startup")
+async def sync_admin_emails_on_startup():
+    wanted = admin_emails()
+    logging.getLogger(__name__).info("ADMIN_EMAILS: %s", ", ".join(sorted(wanted)) or "(none)")
+    if not wanted:
+        return
+    updated = 0
+    cursor = db.users.find({}, {"_id": 0, "user_id": 1, "email": 1, "is_admin": 1})
+    async for user in cursor:
+        if user.get("is_admin"):
+            continue
+        if normalize_email(user.get("email") or "") in wanted:
+            await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
+            updated += 1
+    if updated:
+        logging.getLogger(__name__).info("Granted is_admin to %s existing user(s)", updated)
+
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

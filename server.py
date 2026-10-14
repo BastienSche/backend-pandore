@@ -226,6 +226,181 @@ async def get_public_stats():
         "tracks_count": int(tracks_count or 0),
     }
 
+
+def _parse_iso_dt(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def contest_phase(contest: dict, now: Optional[datetime] = None) -> str:
+    """draft | upcoming | live | ended"""
+    if not contest.get("is_published"):
+        return "draft"
+    now = now or datetime.now(timezone.utc)
+    start = _parse_iso_dt(contest.get("starts_at"))
+    end = _parse_iso_dt(contest.get("ends_at"))
+    if start and now < start:
+        return "upcoming"
+    if end and now > end:
+        return "ended"
+    return "live"
+
+
+async def compute_contest_standings(
+    starts_at: str,
+    ends_at: str,
+    *,
+    limit: int = 50,
+    series_top: int = 3,
+) -> dict:
+    """
+    Classement revenus artistes (euros générés = part vendeur des achats payés)
+    sur [starts_at, ends_at].
+    """
+    start = _parse_iso_dt(starts_at)
+    end = _parse_iso_dt(ends_at)
+    if not start or not end or end < start:
+        return {"leaderboard": [], "series": [], "days": []}
+
+    purchases = await db.purchases.find(
+        {
+            "purchased_at": {"$gte": start.isoformat(), "$lte": end.isoformat()},
+            "artist_id": {"$exists": True, "$ne": None},
+        },
+        {
+            "_id": 0,
+            "artist_id": 1,
+            "purchased_at": 1,
+            "amount": 1,
+            "price_paid": 1,
+            "seller_net_cents": 1,
+        },
+    ).to_list(20000)
+
+    # Fallback: paid Stripe transactions if purchases are sparse
+    if not purchases:
+        txns = await db.payment_transactions.find(
+            {
+                "payment_status": "paid",
+                "created_at": {"$gte": start.isoformat(), "$lte": end.isoformat()},
+                "artist_id": {"$exists": True, "$ne": None},
+            },
+            {
+                "_id": 0,
+                "artist_id": 1,
+                "created_at": 1,
+                "amount": 1,
+                "seller_amount_cents": 1,
+            },
+        ).to_list(20000)
+        purchases = [
+            {
+                "artist_id": t.get("artist_id"),
+                "purchased_at": t.get("created_at"),
+                "amount": t.get("amount"),
+                "seller_net_cents": t.get("seller_amount_cents"),
+            }
+            for t in txns
+        ]
+
+    totals: dict[str, float] = {}
+    daily_by_artist: dict[str, dict[str, float]] = {}
+
+    for p in purchases:
+        artist_id = str(p.get("artist_id") or "").strip()
+        if not artist_id:
+            continue
+        cents = purchase_seller_net_cents(p)
+        if cents <= 0:
+            # ignore free library adds
+            if purchase_amount_cents(p) <= 0:
+                continue
+            cents = purchase_amount_cents(p)
+        if cents <= 0:
+            continue
+        totals[artist_id] = totals.get(artist_id, 0.0) + cents
+        day = str(p.get("purchased_at") or "")[:10]
+        if len(day) == 10:
+            bucket = daily_by_artist.setdefault(artist_id, {})
+            bucket[day] = bucket.get(day, 0.0) + cents
+
+    ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[: max(1, limit)]
+    artist_ids = [aid for aid, _ in ranked]
+    artists = await db.users.find(
+        {"user_id": {"$in": artist_ids}},
+        {"_id": 0, "user_id": 1, "artist_name": 1, "name": 1, "picture": 1},
+    ).to_list(len(artist_ids))
+    by_id = {a["user_id"]: a for a in artists}
+
+    profiles = await db.artist_profiles.find(
+        {"user_id": {"$in": artist_ids}},
+        {"_id": 0, "user_id": 1, "genres": 1, "genre": 1},
+    ).to_list(len(artist_ids))
+    genres_by_id = {p["user_id"]: p for p in profiles}
+
+    leaderboard = []
+    for idx, (aid, cents) in enumerate(ranked, start=1):
+        u = by_id.get(aid) or {}
+        gdoc = genres_by_id.get(aid) or {}
+        genres = gdoc.get("genres") or gdoc.get("genre") or []
+        if isinstance(genres, str):
+            genre_label = genres
+        elif isinstance(genres, list):
+            genre_label = " · ".join(str(x) for x in genres[:2] if x)
+        else:
+            genre_label = ""
+        leaderboard.append(
+            {
+                "rank": idx,
+                "artist_id": aid,
+                "artist_name": u.get("artist_name") or u.get("name") or "Artiste",
+                "picture": u.get("picture"),
+                "genre": genre_label or None,
+                "revenue_cents": int(round(cents)),
+            }
+        )
+
+    # Day labels across contest window (cap chart points for UX)
+    days: list[str] = []
+    cursor = start.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_day = end.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    while cursor <= end_day and len(days) < 62:
+        days.append(cursor.date().isoformat())
+        cursor += timedelta(days=1)
+
+    top_for_series = leaderboard[: max(0, series_top)]
+    series = []
+    for entry in top_for_series:
+        aid = entry["artist_id"]
+        daily = daily_by_artist.get(aid) or {}
+        cumulative = 0.0
+        points = []
+        for day in days:
+            cumulative += float(daily.get(day) or 0.0)
+            points.append({"day": day, "revenue_cents": int(round(cumulative))})
+        series.append(
+            {
+                "artist_id": aid,
+                "artist_name": entry["artist_name"],
+                "picture": entry["picture"],
+                "rank": entry["rank"],
+                "points": points,
+            }
+        )
+
+    return {"leaderboard": leaderboard, "series": series, "days": days}
+
+
 def ensure_stripe_available():
     if not stripe_configured():
         raise HTTPException(
@@ -516,6 +691,22 @@ class FeedbackSubmissionResponse(BaseModel):
     reporter_name: Optional[str] = None
     created_at: str
     status: str = "new"
+
+class ContestCreate(BaseModel):
+    title: str = "Course aux revenus"
+    subtitle: Optional[str] = "Les artistes qui génèrent le plus d'euros"
+    starts_at: str
+    ends_at: str
+    is_published: bool = False
+    prize_label: Optional[str] = None
+
+class ContestUpdate(BaseModel):
+    title: Optional[str] = None
+    subtitle: Optional[str] = None
+    starts_at: Optional[str] = None
+    ends_at: Optional[str] = None
+    is_published: Optional[bool] = None
+    prize_label: Optional[str] = None
 
 # ==================== AUTH HELPERS ====================
 
@@ -1567,6 +1758,168 @@ async def admin_delete_album(
     if not res.deleted_count:
         raise HTTPException(status_code=404, detail="Album not found")
     return {"deleted": True}
+
+
+@api_router.get("/admin/contests")
+async def admin_list_contests(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    items = await db.contests.find({}, {"_id": 0}).sort("starts_at", -1).to_list(100)
+    now = datetime.now(timezone.utc)
+    for c in items:
+        c["phase"] = contest_phase(c, now)
+    return {"items": items}
+
+
+@api_router.post("/admin/contests")
+async def admin_create_contest(
+    payload: ContestCreate,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    start = _parse_iso_dt(payload.starts_at)
+    end = _parse_iso_dt(payload.ends_at)
+    if not start or not end or end <= start:
+        raise HTTPException(status_code=400, detail="Période invalide (starts_at < ends_at)")
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "contest_id": f"contest_{uuid.uuid4().hex[:12]}",
+        "title": (payload.title or "Course aux revenus").strip(),
+        "subtitle": (payload.subtitle or "").strip() or None,
+        "starts_at": start.isoformat(),
+        "ends_at": end.isoformat(),
+        "is_published": bool(payload.is_published),
+        "prize_label": (payload.prize_label or "").strip() or None,
+        "created_at": now,
+        "updated_at": now,
+        "created_by": user.get("user_id"),
+    }
+    if doc["is_published"]:
+        # Un seul concours publié à la fois
+        await db.contests.update_many(
+            {"is_published": True},
+            {"$set": {"is_published": False, "updated_at": now}},
+        )
+    await db.contests.insert_one(doc)
+    out = {k: v for k, v in doc.items() if k != "_id"}
+    out["phase"] = contest_phase(out)
+    return out
+
+
+@api_router.patch("/admin/contests/{contest_id}")
+async def admin_update_contest(
+    contest_id: str,
+    payload: ContestUpdate,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    existing = await db.contests.find_one({"contest_id": contest_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Contest not found")
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if "title" in data:
+        data["title"] = str(data["title"]).strip() or existing.get("title")
+    if "subtitle" in data:
+        data["subtitle"] = str(data["subtitle"]).strip() or None
+    if "prize_label" in data:
+        data["prize_label"] = str(data["prize_label"]).strip() or None
+    if "starts_at" in data:
+        start = _parse_iso_dt(data["starts_at"])
+        if not start:
+            raise HTTPException(status_code=400, detail="starts_at invalide")
+        data["starts_at"] = start.isoformat()
+    if "ends_at" in data:
+        end = _parse_iso_dt(data["ends_at"])
+        if not end:
+            raise HTTPException(status_code=400, detail="ends_at invalide")
+        data["ends_at"] = end.isoformat()
+    start = _parse_iso_dt(data.get("starts_at") or existing.get("starts_at"))
+    end = _parse_iso_dt(data.get("ends_at") or existing.get("ends_at"))
+    if not start or not end or end <= start:
+        raise HTTPException(status_code=400, detail="Période invalide")
+    now = datetime.now(timezone.utc).isoformat()
+    data["updated_at"] = now
+    if data.get("is_published") is True:
+        await db.contests.update_many(
+            {"contest_id": {"$ne": contest_id}, "is_published": True},
+            {"$set": {"is_published": False, "updated_at": now}},
+        )
+    await db.contests.update_one({"contest_id": contest_id}, {"$set": data})
+    doc = await db.contests.find_one({"contest_id": contest_id}, {"_id": 0})
+    doc["phase"] = contest_phase(doc)
+    return doc
+
+
+@api_router.delete("/admin/contests/{contest_id}")
+async def admin_delete_contest(
+    contest_id: str,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    res = await db.contests.delete_one({"contest_id": contest_id})
+    if not res.deleted_count:
+        raise HTTPException(status_code=404, detail="Contest not found")
+    return {"deleted": True}
+
+
+@api_router.get("/contests/current")
+async def get_current_contest():
+    """Concours publié en cours (ou à venir) + top classement + courbes."""
+    now = datetime.now(timezone.utc)
+    published = await db.contests.find({"is_published": True}, {"_id": 0}).sort("starts_at", -1).to_list(20)
+    contest = None
+    for c in published:
+        phase = contest_phase(c, now)
+        c["phase"] = phase
+        if phase in {"live", "upcoming"}:
+            contest = c
+            break
+    if not contest and published:
+        # Dernier terminé encore affiché brièvement
+        contest = published[0]
+        contest["phase"] = contest_phase(contest, now)
+    if not contest:
+        return {"contest": None, "leaderboard": [], "series": [], "days": []}
+
+    standings = await compute_contest_standings(
+        contest["starts_at"],
+        contest["ends_at"],
+        limit=10,
+        series_top=3,
+    )
+    return {
+        "contest": contest,
+        "leaderboard": standings["leaderboard"],
+        "series": standings["series"],
+        "days": standings["days"],
+    }
+
+
+@api_router.get("/contests/{contest_id}")
+async def get_contest_detail(contest_id: str, limit: int = Query(50, ge=1, le=200)):
+    contest = await db.contests.find_one({"contest_id": contest_id}, {"_id": 0})
+    if not contest or not contest.get("is_published"):
+        raise HTTPException(status_code=404, detail="Contest not found")
+    contest["phase"] = contest_phase(contest)
+    standings = await compute_contest_standings(
+        contest["starts_at"],
+        contest["ends_at"],
+        limit=limit,
+        series_top=5,
+    )
+    return {
+        "contest": contest,
+        "leaderboard": standings["leaderboard"],
+        "series": standings["series"],
+        "days": standings["days"],
+    }
+
 
 # ==================== ARTIST PROFILE ROUTES ====================
 
@@ -3505,16 +3858,21 @@ async def sync_admin_emails_on_startup():
     logging.getLogger(__name__).info("ADMIN_EMAILS: %s", ", ".join(sorted(wanted)) or "(none)")
     if not wanted:
         return
-    updated = 0
-    cursor = db.users.find({}, {"_id": 0, "user_id": 1, "email": 1, "is_admin": 1})
-    async for user in cursor:
-        if user.get("is_admin"):
-            continue
-        if normalize_email(user.get("email") or "") in wanted:
-            await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
-            updated += 1
-    if updated:
-        logging.getLogger(__name__).info("Granted is_admin to %s existing user(s)", updated)
+    try:
+        updated = 0
+        cursor = db.users.find({}, {"_id": 0, "user_id": 1, "email": 1, "is_admin": 1})
+        async for user in cursor:
+            if user.get("is_admin"):
+                continue
+            if normalize_email(user.get("email") or "") in wanted:
+                await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
+                updated += 1
+        if updated:
+            logging.getLogger(__name__).info("Granted is_admin to %s existing user(s)", updated)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Admin email sync skipped (Mongo unavailable). App still starts."
+        )
 
 
 @app.on_event("shutdown")

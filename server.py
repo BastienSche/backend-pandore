@@ -84,6 +84,10 @@ fs = AsyncIOMotorGridFSBucket(db, bucket_name="uploads")
 # JWT Configuration
 JWT_SECRET = os.environ.get('JWT_SECRET', 'pandore_secret_key_change_in_production_2025')
 JWT_ALGORITHM = os.environ.get('JWT_ALGORITHM', 'HS256')
+ACCESS_TOKEN_TTL = timedelta(hours=1)
+REFRESH_TOKEN_TTL = timedelta(days=30)
+ACCESS_TOKEN_MAX_AGE = int(ACCESS_TOKEN_TTL.total_seconds())
+REFRESH_TOKEN_MAX_AGE = int(REFRESH_TOKEN_TTL.total_seconds())
 
 # Stripe Configuration
 STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY')
@@ -717,14 +721,117 @@ def verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
 
 def create_jwt_token(user_id: str) -> str:
+    """Access token court (compat: ancien nom create_jwt_token)."""
     payload = {
         "user_id": user_id,
-        "exp": datetime.now(timezone.utc) + timedelta(days=7)
+        "type": "access",
+        "exp": datetime.now(timezone.utc) + ACCESS_TOKEN_TTL,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-def hash_reset_token(raw_token: str) -> str:
+def hash_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+def hash_reset_token(raw_token: str) -> str:
+    return hash_token(raw_token)
+
+async def create_refresh_token(user_id: str) -> str:
+    raw = secrets.token_urlsafe(48)
+    now = datetime.now(timezone.utc)
+    await db.refresh_tokens.insert_one(
+        {
+            "token_hash": hash_token(raw),
+            "user_id": user_id,
+            "created_at": now.isoformat(),
+            "expires_at": (now + REFRESH_TOKEN_TTL).isoformat(),
+            "revoked_at": None,
+        }
+    )
+    return raw
+
+def set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    response.set_cookie(
+        key="session_token",
+        value=access_token,
+        httponly=False,
+        secure=False,
+        samesite="lax",
+        path="/",
+        max_age=ACCESS_TOKEN_MAX_AGE,
+    )
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=False,
+        secure=False,
+        samesite="lax",
+        path="/",
+        max_age=REFRESH_TOKEN_MAX_AGE,
+    )
+
+def clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(key="session_token", path="/")
+    response.delete_cookie(key="refresh_token", path="/")
+
+async def issue_auth_tokens(user_id: str, response: Optional[Response] = None) -> dict:
+    access_token = create_jwt_token(user_id)
+    refresh_token = await create_refresh_token(user_id)
+    if response is not None:
+        set_auth_cookies(response, access_token, refresh_token)
+    return {
+        "token": access_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": ACCESS_TOKEN_MAX_AGE,
+    }
+
+async def revoke_refresh_token(raw_token: Optional[str]) -> None:
+    if not raw_token:
+        return
+    await db.refresh_tokens.update_one(
+        {"token_hash": hash_token(raw_token), "revoked_at": None},
+        {"$set": {"revoked_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+async def revoke_user_refresh_tokens(user_id: str) -> None:
+    await db.refresh_tokens.update_many(
+        {"user_id": user_id, "revoked_at": None},
+        {"$set": {"revoked_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+def _parse_iso_dt(value) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+async def rotate_refresh_token(raw_token: str, response: Optional[Response] = None) -> dict:
+    token_hash = hash_token(raw_token)
+    doc = await db.refresh_tokens.find_one({"token_hash": token_hash}, {"_id": 0})
+    if not doc or doc.get("revoked_at"):
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    expires_at = _parse_iso_dt(doc["expires_at"])
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+
+    user_id = doc["user_id"]
+    user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not user_doc:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    # Rotation : invalide l'ancien refresh avant d'en émettre un nouveau
+    await db.refresh_tokens.update_one(
+        {"token_hash": token_hash},
+        {"$set": {"revoked_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    tokens = await issue_auth_tokens(user_id, response)
+    return {
+        **tokens,
+        "user": user_response_from_doc(await ensure_admin_flag(user_doc)),
+    }
 
 def build_reset_password_url(raw_token: str) -> str:
     if FRONTEND_RESET_PASSWORD_URL:
@@ -806,6 +913,10 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
     # Check if it's a JWT token (custom auth)
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        token_type = payload.get("type")
+        # Accepte les access tokens + les JWT legacy (sans champ type)
+        if token_type and token_type != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
         user_id = payload.get("user_id")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
@@ -814,6 +925,8 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
         if not user_doc:
             raise HTTPException(status_code=401, detail="User not found")
         return await ensure_admin_flag(user_doc)
+    except HTTPException:
+        raise
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
@@ -825,11 +938,7 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
         raise HTTPException(status_code=401, detail="Invalid session")
     
     # Check expiry
-    expires_at = session_doc["expires_at"]
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    expires_at = _parse_iso_dt(session_doc["expires_at"])
     if expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=401, detail="Session expired")
     
@@ -924,23 +1033,29 @@ async def login(credentials: UserLogin, response: Response):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user_doc = await ensure_admin_flag(user_doc)
-    token = create_jwt_token(user_doc["user_id"])
-    
-    # Set cookie
-    response.set_cookie(
-        key="session_token",
-        value=token,
-        httponly=False,
-        secure=False,
-        samesite="lax",
-        path="/",
-        max_age=7*24*60*60
-    )
-    
+    tokens = await issue_auth_tokens(user_doc["user_id"], response)
     return {
-        "token": token,
-        "user": user_response_from_doc(user_doc)
+        **tokens,
+        "user": user_response_from_doc(user_doc),
     }
+
+async def _read_refresh_token_from_request(request: Request) -> Optional[str]:
+    raw = request.cookies.get("refresh_token") if request else None
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and body.get("refresh_token"):
+            raw = body.get("refresh_token")
+    except Exception:
+        pass
+    return raw
+
+@api_router.post("/auth/refresh")
+async def refresh_auth(request: Request, response: Response):
+    """Échange un refresh token valide contre une nouvelle paire access/refresh."""
+    raw = await _read_refresh_token_from_request(request)
+    if not raw:
+        raise HTTPException(status_code=401, detail="Missing refresh token")
+    return await rotate_refresh_token(raw, response)
 
 @api_router.post("/auth/forgot-password")
 async def forgot_password(payload: ForgotPasswordRequest):
@@ -1131,17 +1246,18 @@ async def upsert_google_user(user_info: dict) -> dict:
     user_doc["user_id"] = user_id
     return user_doc
 
-async def create_google_session(user_id: str) -> str:
-    session_token = uuid.uuid4().hex
+async def create_google_session(user_id: str, response: Optional[Response] = None) -> dict:
+    """Émet JWT access + refresh (cookies optionnels). Conserve une session opaque pour compat."""
+    tokens = await issue_auth_tokens(user_id, response)
     session_doc = {
         "user_id": user_id,
-        "session_token": session_token,
-        "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
+        "session_token": tokens["access_token"],
+        "expires_at": datetime.now(timezone.utc) + ACCESS_TOKEN_TTL,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.user_sessions.delete_many({"user_id": user_id})
     await db.user_sessions.insert_one(session_doc)
-    return session_token
+    return tokens
 
 @api_router.get("/auth/google/callback")
 async def google_callback_redirect(
@@ -1160,39 +1276,22 @@ async def google_callback_redirect(
     validate_oauth_state(request, state)
     user_info = await exchange_google_code_for_user(code)
     user_doc = await upsert_google_user(user_info)
-    session_token = await create_google_session(user_doc["user_id"])
 
     redirect_url = FRONTEND_OAUTH_REDIRECT_URL
     if redirect_url:
         response = RedirectResponse(url=redirect_url)
-        response.set_cookie(
-            key="session_token",
-            value=session_token,
-            httponly=False,
-            secure=False,
-            samesite="lax",
-            path="/",
-            max_age=7 * 24 * 60 * 60,
-        )
+        tokens = await create_google_session(user_doc["user_id"], response)
         response.delete_cookie(key="oauth_state", path="/")
         return response
 
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=False,
-        secure=False,
-        samesite="lax",
-        path="/",
-        max_age=7 * 24 * 60 * 60,
-    )
+    tokens = await create_google_session(user_doc["user_id"], response)
     response.delete_cookie(key="oauth_state", path="/")
     return GoogleSessionResponse(
         user_id=user_doc["user_id"],
         email=user_doc["email"],
         name=user_doc["name"],
         picture=user_doc.get("picture"),
-        session_token=session_token,
+        session_token=tokens["access_token"],
     )
 
 @api_router.post("/auth/google/callback", response_model=GoogleSessionResponse)
@@ -1205,18 +1304,7 @@ async def google_callback_api(
     validate_oauth_state(request, payload.state)
     user_info = await exchange_google_code_for_user(payload.code)
     user_doc = await upsert_google_user(user_info)
-    session_token = await create_google_session(user_doc["user_id"])
-    
-    # Set cookie
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=False,
-        secure=False,
-        samesite="lax",
-        path="/",
-        max_age=7*24*60*60
-    )
+    tokens = await create_google_session(user_doc["user_id"], response)
     
     response.delete_cookie(key="oauth_state", path="/")
     return GoogleSessionResponse(
@@ -1224,7 +1312,7 @@ async def google_callback_api(
         email=user_doc["email"],
         name=user_doc["name"],
         picture=user_doc.get("picture"),
-        session_token=session_token,
+        session_token=tokens["access_token"],
     )
 
 @api_router.get("/auth/me", response_model=UserResponse)
@@ -1255,15 +1343,22 @@ async def update_user_settings(payload: UserSettings, authorization: Optional[st
     return payload
 
 @api_router.post("/auth/logout")
-async def logout(response: Response, authorization: Optional[str] = Header(None), request: Request = None):
-    user = await get_current_user(authorization, request)
-    
-    # Delete all sessions for this user
-    await db.user_sessions.delete_many({"user_id": user["user_id"]})
-    
-    # Clear cookie
-    response.delete_cookie(key="session_token", path="/")
-    
+async def logout(
+    response: Response,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    refresh_raw = await _read_refresh_token_from_request(request) if request else None
+
+    try:
+        user = await get_current_user(authorization, request)
+        await db.user_sessions.delete_many({"user_id": user["user_id"]})
+        await revoke_user_refresh_tokens(user["user_id"])
+    except HTTPException:
+        # Access expiré : on révoque quand même le refresh fourni
+        await revoke_refresh_token(refresh_raw)
+
+    clear_auth_cookies(response)
     return {"message": "Logged out successfully"}
 
 @api_router.put("/auth/role")

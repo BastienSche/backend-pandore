@@ -84,6 +84,10 @@ fs = AsyncIOMotorGridFSBucket(db, bucket_name="uploads")
 # JWT Configuration
 JWT_SECRET = os.environ.get('JWT_SECRET', 'pandore_secret_key_change_in_production_2025')
 JWT_ALGORITHM = os.environ.get('JWT_ALGORITHM', 'HS256')
+ACCESS_TOKEN_TTL = timedelta(hours=1)
+REFRESH_TOKEN_TTL = timedelta(days=30)
+ACCESS_TOKEN_MAX_AGE = int(ACCESS_TOKEN_TTL.total_seconds())
+REFRESH_TOKEN_MAX_AGE = int(REFRESH_TOKEN_TTL.total_seconds())
 
 # Stripe Configuration
 STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY')
@@ -99,6 +103,7 @@ PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
 HARDCODED_ADMIN_EMAILS = (
     "bastien.schektman@gmail.com",
     "merwan.snk@gmail.com",
+    "merwane.snk@gmail.com",
 )
 
 
@@ -139,18 +144,41 @@ def _load_password_reset_config() -> dict:
 PASSWORD_RESET_CONFIG = _load_password_reset_config()
 PASSWORD_RESET_SMTP = PASSWORD_RESET_CONFIG.get("smtp") if isinstance(PASSWORD_RESET_CONFIG.get("smtp"), dict) else {}
 
-FRONTEND_RESET_PASSWORD_URL = str(PASSWORD_RESET_CONFIG.get("frontend_reset_password_url") or "").strip().rstrip("/")
-PASSWORD_RESET_TOKEN_TTL_MINUTES = int(PASSWORD_RESET_CONFIG.get("token_ttl_minutes") or 30)
+FRONTEND_RESET_PASSWORD_URL = str(
+    os.environ.get("FRONTEND_RESET_PASSWORD_URL")
+    or PASSWORD_RESET_CONFIG.get("frontend_reset_password_url")
+    or ""
+).strip().rstrip("/")
+PASSWORD_RESET_TOKEN_TTL_MINUTES = int(
+    os.environ.get("PASSWORD_RESET_TOKEN_TTL_MINUTES")
+    or PASSWORD_RESET_CONFIG.get("token_ttl_minutes")
+    or 30
+)
 
-# SMTP / email (forgot password) depuis password_reset.config*.json
-SMTP_HOST = str(PASSWORD_RESET_SMTP.get("host") or "").strip()
-SMTP_PORT = int(PASSWORD_RESET_SMTP.get("port") or 587)
-SMTP_USERNAME = str(PASSWORD_RESET_SMTP.get("username") or "").strip()
-SMTP_PASSWORD = str(PASSWORD_RESET_SMTP.get("password") or "")
-SMTP_FROM_EMAIL = str(PASSWORD_RESET_SMTP.get("from_email") or "").strip()
-SMTP_FROM_NAME = str(PASSWORD_RESET_SMTP.get("from_name") or "Kloud").strip()
-SMTP_REPLY_TO = str(PASSWORD_RESET_SMTP.get("reply_to") or "").strip()
-SMTP_USE_TLS = str(PASSWORD_RESET_SMTP.get("use_tls", True)).strip().lower() in {"1", "true", "yes", "on"}
+# SMTP / email : env vars override password_reset.config*.json
+SMTP_HOST = str(os.environ.get("SMTP_HOST") or PASSWORD_RESET_SMTP.get("host") or "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT") or PASSWORD_RESET_SMTP.get("port") or 587)
+SMTP_USERNAME = str(os.environ.get("SMTP_USERNAME") or PASSWORD_RESET_SMTP.get("username") or "").strip()
+SMTP_PASSWORD = str(
+    os.environ.get("RESEND_API_KEY")
+    or os.environ.get("SMTP_PASSWORD")
+    or PASSWORD_RESET_SMTP.get("password")
+    or ""
+)
+SMTP_FROM_EMAIL = str(
+    os.environ.get("SMTP_FROM_EMAIL") or PASSWORD_RESET_SMTP.get("from_email") or ""
+).strip()
+SMTP_FROM_NAME = str(
+    os.environ.get("SMTP_FROM_NAME") or PASSWORD_RESET_SMTP.get("from_name") or "Kloud"
+).strip()
+SMTP_REPLY_TO = str(
+    os.environ.get("SMTP_REPLY_TO") or PASSWORD_RESET_SMTP.get("reply_to") or ""
+).strip()
+SMTP_USE_TLS = str(
+    os.environ.get("SMTP_USE_TLS")
+    if os.environ.get("SMTP_USE_TLS") is not None
+    else PASSWORD_RESET_SMTP.get("use_tls", True)
+).strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -717,14 +745,117 @@ def verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
 
 def create_jwt_token(user_id: str) -> str:
+    """Access token court (compat: ancien nom create_jwt_token)."""
     payload = {
         "user_id": user_id,
-        "exp": datetime.now(timezone.utc) + timedelta(days=7)
+        "type": "access",
+        "exp": datetime.now(timezone.utc) + ACCESS_TOKEN_TTL,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-def hash_reset_token(raw_token: str) -> str:
+def hash_token(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+def hash_reset_token(raw_token: str) -> str:
+    return hash_token(raw_token)
+
+async def create_refresh_token(user_id: str) -> str:
+    raw = secrets.token_urlsafe(48)
+    now = datetime.now(timezone.utc)
+    await db.refresh_tokens.insert_one(
+        {
+            "token_hash": hash_token(raw),
+            "user_id": user_id,
+            "created_at": now.isoformat(),
+            "expires_at": (now + REFRESH_TOKEN_TTL).isoformat(),
+            "revoked_at": None,
+        }
+    )
+    return raw
+
+def set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    response.set_cookie(
+        key="session_token",
+        value=access_token,
+        httponly=False,
+        secure=False,
+        samesite="lax",
+        path="/",
+        max_age=ACCESS_TOKEN_MAX_AGE,
+    )
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=False,
+        secure=False,
+        samesite="lax",
+        path="/",
+        max_age=REFRESH_TOKEN_MAX_AGE,
+    )
+
+def clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(key="session_token", path="/")
+    response.delete_cookie(key="refresh_token", path="/")
+
+async def issue_auth_tokens(user_id: str, response: Optional[Response] = None) -> dict:
+    access_token = create_jwt_token(user_id)
+    refresh_token = await create_refresh_token(user_id)
+    if response is not None:
+        set_auth_cookies(response, access_token, refresh_token)
+    return {
+        "token": access_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": ACCESS_TOKEN_MAX_AGE,
+    }
+
+async def revoke_refresh_token(raw_token: Optional[str]) -> None:
+    if not raw_token:
+        return
+    await db.refresh_tokens.update_one(
+        {"token_hash": hash_token(raw_token), "revoked_at": None},
+        {"$set": {"revoked_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+async def revoke_user_refresh_tokens(user_id: str) -> None:
+    await db.refresh_tokens.update_many(
+        {"user_id": user_id, "revoked_at": None},
+        {"$set": {"revoked_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+def _parse_iso_dt(value) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+async def rotate_refresh_token(raw_token: str, response: Optional[Response] = None) -> dict:
+    token_hash = hash_token(raw_token)
+    doc = await db.refresh_tokens.find_one({"token_hash": token_hash}, {"_id": 0})
+    if not doc or doc.get("revoked_at"):
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    expires_at = _parse_iso_dt(doc["expires_at"])
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+
+    user_id = doc["user_id"]
+    user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not user_doc:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    # Rotation : invalide l'ancien refresh avant d'en émettre un nouveau
+    await db.refresh_tokens.update_one(
+        {"token_hash": token_hash},
+        {"$set": {"revoked_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    tokens = await issue_auth_tokens(user_id, response)
+    return {
+        **tokens,
+        "user": user_response_from_doc(await ensure_admin_flag(user_doc)),
+    }
 
 def build_reset_password_url(raw_token: str) -> str:
     if FRONTEND_RESET_PASSWORD_URL:
@@ -738,9 +869,9 @@ def build_reset_password_url(raw_token: str) -> str:
     return f"{base}{sep}token={raw_token}"
 
 def smtp_configured() -> bool:
-    return bool(SMTP_HOST and SMTP_FROM_EMAIL)
+    return bool(SMTP_FROM_EMAIL and SMTP_PASSWORD and (SMTP_HOST or SMTP_PASSWORD.startswith("re_")))
 
-def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+def _password_reset_email_bodies(*, to_name: Optional[str], reset_url: str) -> tuple[str, str, str]:
     subject = "Réinitialisation de votre mot de passe Kloud"
     recipient_name = (to_name or "").strip() or "there"
     plain_text = (
@@ -758,6 +889,10 @@ def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], res
         "<p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>"
         "<p>— Kloud</p>"
     )
+    return subject, plain_text, html
+
+def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+    subject, plain_text, html = _password_reset_email_bodies(to_name=to_name, reset_url=reset_url)
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -768,12 +903,74 @@ def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], res
     msg.set_content(plain_text)
     msg.add_alternative(html, subtype="html")
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+    host = SMTP_HOST or "smtp.resend.com"
+    port = SMTP_PORT or 587
+
+    # Port 465 = SMTPS implicite ; 587 = STARTTLS
+    if port in (465, 2465):
+        with smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context()) as smtp:
+            if SMTP_USERNAME:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(msg)
+        return
+
+    with smtplib.SMTP(host, port, timeout=20) as smtp:
+        smtp.ehlo()
         if SMTP_USE_TLS:
             smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
         if SMTP_USERNAME:
             smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
         smtp.send_message(msg)
+
+async def send_password_reset_email_resend_api(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+    """Envoi via l'API HTTP Resend (plus fiable que SMTP derrière certains hébergeurs)."""
+    import aiohttp
+
+    subject, plain_text, html = _password_reset_email_bodies(to_name=to_name, reset_url=reset_url)
+    payload = {
+        "from": f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>",
+        "to": [to_email],
+        "subject": subject,
+        "html": html,
+        "text": plain_text,
+    }
+    if SMTP_REPLY_TO:
+        payload["reply_to"] = SMTP_REPLY_TO
+
+    headers = {
+        "Authorization": f"Bearer {SMTP_PASSWORD}",
+        "Content-Type": "application/json",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.resend.com/emails",
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Resend API {resp.status}: {body[:500]}")
+
+async def send_password_reset_email(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+    use_resend_api = SMTP_PASSWORD.startswith("re_") or SMTP_USERNAME.lower() == "resend" or (
+        SMTP_HOST or ""
+    ).endswith("resend.com")
+    if use_resend_api:
+        try:
+            await send_password_reset_email_resend_api(
+                to_email=to_email, to_name=to_name, reset_url=reset_url
+            )
+            return
+        except Exception:
+            logger.exception("Resend API failed, falling back to SMTP to=%s", to_email)
+    await asyncio.to_thread(
+        send_password_reset_email_sync,
+        to_email=to_email,
+        to_name=to_name,
+        reset_url=reset_url,
+    )
 
 def ensure_google_oauth_configured():
     if not GOOGLE_OAUTH_CLIENT_ID or not GOOGLE_OAUTH_CLIENT_SECRET or not GOOGLE_OAUTH_REDIRECT_URI:
@@ -806,6 +1003,10 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
     # Check if it's a JWT token (custom auth)
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        token_type = payload.get("type")
+        # Accepte les access tokens + les JWT legacy (sans champ type)
+        if token_type and token_type != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
         user_id = payload.get("user_id")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
@@ -814,6 +1015,8 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
         if not user_doc:
             raise HTTPException(status_code=401, detail="User not found")
         return await ensure_admin_flag(user_doc)
+    except HTTPException:
+        raise
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
@@ -825,11 +1028,7 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
         raise HTTPException(status_code=401, detail="Invalid session")
     
     # Check expiry
-    expires_at = session_doc["expires_at"]
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    expires_at = _parse_iso_dt(session_doc["expires_at"])
     if expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=401, detail="Session expired")
     
@@ -924,33 +1123,45 @@ async def login(credentials: UserLogin, response: Response):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user_doc = await ensure_admin_flag(user_doc)
-    token = create_jwt_token(user_doc["user_id"])
-    
-    # Set cookie
-    response.set_cookie(
-        key="session_token",
-        value=token,
-        httponly=False,
-        secure=False,
-        samesite="lax",
-        path="/",
-        max_age=7*24*60*60
-    )
-    
+    tokens = await issue_auth_tokens(user_doc["user_id"], response)
     return {
-        "token": token,
-        "user": user_response_from_doc(user_doc)
+        **tokens,
+        "user": user_response_from_doc(user_doc),
     }
+
+async def _read_refresh_token_from_request(request: Request) -> Optional[str]:
+    raw = request.cookies.get("refresh_token") if request else None
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and body.get("refresh_token"):
+            raw = body.get("refresh_token")
+    except Exception:
+        pass
+    return raw
+
+@api_router.post("/auth/refresh")
+async def refresh_auth(request: Request, response: Response):
+    """Échange un refresh token valide contre une nouvelle paire access/refresh."""
+    raw = await _read_refresh_token_from_request(request)
+    if not raw:
+        raise HTTPException(status_code=401, detail="Missing refresh token")
+    return await rotate_refresh_token(raw, response)
 
 @api_router.post("/auth/forgot-password")
 async def forgot_password(payload: ForgotPasswordRequest):
     """
     Toujours renvoyer un message générique pour éviter l'énumération des emails.
-    En local/dev sans SMTP configuré, on renvoie aussi le token/lien pour faciliter les tests.
+    En local/dev sans SMTP (ou si l'envoi échoue), on renvoie aussi le token/lien pour faciliter les tests.
     """
-    generic_message = "Si cet email existe, un lien de réinitialisation a été généré."
-    user_doc = await db.users.find_one({"email": payload.email}, {"_id": 0})
+    generic_message = "Si cet email existe, un lien de réinitialisation a été envoyé."
+    # Même lookup souple que le login (casse / Gmail dots)
+    user_doc = await find_user_by_email(str(payload.email))
     if not user_doc:
+        return {"message": generic_message}
+
+    if not user_doc.get("password_hash"):
+        # Compte OAuth-only : pas de reset mot de passe email
+        logger.info("password-reset skipped (no password) user_id=%s", user_doc.get("user_id"))
         return {"message": generic_message}
 
     raw_token = secrets.token_urlsafe(32)
@@ -972,14 +1183,16 @@ async def forgot_password(payload: ForgotPasswordRequest):
     )
 
     reset_url = build_reset_password_url(raw_token)
+    email_sent = False
     if smtp_configured():
         try:
-            await asyncio.to_thread(
-                send_password_reset_email_sync,
+            await send_password_reset_email(
                 to_email=user_doc.get("email", ""),
                 to_name=user_doc.get("name"),
                 reset_url=reset_url,
             )
+            email_sent = True
+            logger.info("password-reset-email-sent user_id=%s to=%s", user_doc["user_id"], user_doc.get("email"))
         except Exception:
             # Ne pas leak d'info côté client (email enum). Journaliser côté serveur.
             logger.exception("password-reset-email-send-failed user_id=%s", user_doc["user_id"])
@@ -990,13 +1203,16 @@ async def forgot_password(payload: ForgotPasswordRequest):
             reset_url,
         )
 
-    if _app_env != "production" and not smtp_configured():
+    # Dev / échec d'envoi hors prod : lien de secours pour ne pas bloquer
+    if _app_env != "production" and not email_sent:
         return {
             "message": generic_message,
             "reset_token": raw_token,
             "reset_url": reset_url,
             "expires_in_minutes": PASSWORD_RESET_TOKEN_TTL_MINUTES,
+            "email_sent": False,
         }
+    # En production on ne renvoie jamais email_sent (évite l'énumération d'emails)
     return {"message": generic_message}
 
 @api_router.post("/auth/reset-password")
@@ -1131,17 +1347,18 @@ async def upsert_google_user(user_info: dict) -> dict:
     user_doc["user_id"] = user_id
     return user_doc
 
-async def create_google_session(user_id: str) -> str:
-    session_token = uuid.uuid4().hex
+async def create_google_session(user_id: str, response: Optional[Response] = None) -> dict:
+    """Émet JWT access + refresh (cookies optionnels). Conserve une session opaque pour compat."""
+    tokens = await issue_auth_tokens(user_id, response)
     session_doc = {
         "user_id": user_id,
-        "session_token": session_token,
-        "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
+        "session_token": tokens["access_token"],
+        "expires_at": datetime.now(timezone.utc) + ACCESS_TOKEN_TTL,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.user_sessions.delete_many({"user_id": user_id})
     await db.user_sessions.insert_one(session_doc)
-    return session_token
+    return tokens
 
 @api_router.get("/auth/google/callback")
 async def google_callback_redirect(
@@ -1160,39 +1377,22 @@ async def google_callback_redirect(
     validate_oauth_state(request, state)
     user_info = await exchange_google_code_for_user(code)
     user_doc = await upsert_google_user(user_info)
-    session_token = await create_google_session(user_doc["user_id"])
 
     redirect_url = FRONTEND_OAUTH_REDIRECT_URL
     if redirect_url:
         response = RedirectResponse(url=redirect_url)
-        response.set_cookie(
-            key="session_token",
-            value=session_token,
-            httponly=False,
-            secure=False,
-            samesite="lax",
-            path="/",
-            max_age=7 * 24 * 60 * 60,
-        )
+        tokens = await create_google_session(user_doc["user_id"], response)
         response.delete_cookie(key="oauth_state", path="/")
         return response
 
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=False,
-        secure=False,
-        samesite="lax",
-        path="/",
-        max_age=7 * 24 * 60 * 60,
-    )
+    tokens = await create_google_session(user_doc["user_id"], response)
     response.delete_cookie(key="oauth_state", path="/")
     return GoogleSessionResponse(
         user_id=user_doc["user_id"],
         email=user_doc["email"],
         name=user_doc["name"],
         picture=user_doc.get("picture"),
-        session_token=session_token,
+        session_token=tokens["access_token"],
     )
 
 @api_router.post("/auth/google/callback", response_model=GoogleSessionResponse)
@@ -1205,18 +1405,7 @@ async def google_callback_api(
     validate_oauth_state(request, payload.state)
     user_info = await exchange_google_code_for_user(payload.code)
     user_doc = await upsert_google_user(user_info)
-    session_token = await create_google_session(user_doc["user_id"])
-    
-    # Set cookie
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=False,
-        secure=False,
-        samesite="lax",
-        path="/",
-        max_age=7*24*60*60
-    )
+    tokens = await create_google_session(user_doc["user_id"], response)
     
     response.delete_cookie(key="oauth_state", path="/")
     return GoogleSessionResponse(
@@ -1224,7 +1413,7 @@ async def google_callback_api(
         email=user_doc["email"],
         name=user_doc["name"],
         picture=user_doc.get("picture"),
-        session_token=session_token,
+        session_token=tokens["access_token"],
     )
 
 @api_router.get("/auth/me", response_model=UserResponse)
@@ -1255,15 +1444,22 @@ async def update_user_settings(payload: UserSettings, authorization: Optional[st
     return payload
 
 @api_router.post("/auth/logout")
-async def logout(response: Response, authorization: Optional[str] = Header(None), request: Request = None):
-    user = await get_current_user(authorization, request)
-    
-    # Delete all sessions for this user
-    await db.user_sessions.delete_many({"user_id": user["user_id"]})
-    
-    # Clear cookie
-    response.delete_cookie(key="session_token", path="/")
-    
+async def logout(
+    response: Response,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    refresh_raw = await _read_refresh_token_from_request(request) if request else None
+
+    try:
+        user = await get_current_user(authorization, request)
+        await db.user_sessions.delete_many({"user_id": user["user_id"]})
+        await revoke_user_refresh_tokens(user["user_id"])
+    except HTTPException:
+        # Access expiré : on révoque quand même le refresh fourni
+        await revoke_refresh_token(refresh_raw)
+
+    clear_auth_cookies(response)
     return {"message": "Logged out successfully"}
 
 @api_router.put("/auth/role")
@@ -2455,6 +2651,27 @@ async def update_album(album_id: str, album_data: dict, authorization: Optional[
     
     updated_album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
     return AlbumResponse(**updated_album)
+
+@api_router.delete("/albums/{album_id}")
+async def delete_album(album_id: str, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+
+    album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+
+    if album["artist_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    track_ids = list(album.get("track_ids") or [])
+    # Supprime les titres rattachés à cet album (création album + liens track_ids)
+    delete_filter = {"$or": [{"album_id": album_id}]}
+    if track_ids:
+        delete_filter["$or"].append({"track_id": {"$in": track_ids}})
+    await db.tracks.delete_many(delete_filter)
+
+    await db.albums.delete_one({"album_id": album_id})
+    return {"message": "Album deleted"}
 
 @api_router.post("/albums/{album_id}/tracks", response_model=AlbumTrackResponse)
 async def create_album_track(album_id: str, track_data: AlbumTrackCreate, authorization: Optional[str] = Header(None), request: Request = None):
@@ -3746,8 +3963,30 @@ async def publish_track(track_id: str, authorization: Optional[str] = Header(Non
         {"track_id": track_id},
         {"$set": {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
-    
     return {"status": new_status, "message": f"Track {'published' if new_status == 'published' else 'unpublished'} successfully"}
+
+@api_router.put("/artist/albums/{album_id}/publish")
+async def publish_album(album_id: str, authorization: Optional[str] = Header(None), request: Request = None):
+    """Toggle album publish status"""
+    user = await get_current_user(authorization, request)
+
+    if user["role"] != "artist":
+        raise HTTPException(status_code=403, detail="Only artists can publish albums")
+
+    album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+
+    if album["artist_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    new_status = "published" if album.get("status") == "draft" else "draft"
+
+    await db.albums.update_one(
+        {"album_id": album_id},
+        {"$set": {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return {"status": new_status, "message": f"Album {'published' if new_status == 'published' else 'unpublished'} successfully"}
 
 @api_router.post("/plays")
 async def record_play(

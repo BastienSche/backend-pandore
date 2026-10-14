@@ -103,6 +103,7 @@ PUBLIC_FRONTEND_URL = os.environ.get("PUBLIC_FRONTEND_URL", "").rstrip("/")
 HARDCODED_ADMIN_EMAILS = (
     "bastien.schektman@gmail.com",
     "merwan.snk@gmail.com",
+    "merwane.snk@gmail.com",
 )
 
 
@@ -143,18 +144,41 @@ def _load_password_reset_config() -> dict:
 PASSWORD_RESET_CONFIG = _load_password_reset_config()
 PASSWORD_RESET_SMTP = PASSWORD_RESET_CONFIG.get("smtp") if isinstance(PASSWORD_RESET_CONFIG.get("smtp"), dict) else {}
 
-FRONTEND_RESET_PASSWORD_URL = str(PASSWORD_RESET_CONFIG.get("frontend_reset_password_url") or "").strip().rstrip("/")
-PASSWORD_RESET_TOKEN_TTL_MINUTES = int(PASSWORD_RESET_CONFIG.get("token_ttl_minutes") or 30)
+FRONTEND_RESET_PASSWORD_URL = str(
+    os.environ.get("FRONTEND_RESET_PASSWORD_URL")
+    or PASSWORD_RESET_CONFIG.get("frontend_reset_password_url")
+    or ""
+).strip().rstrip("/")
+PASSWORD_RESET_TOKEN_TTL_MINUTES = int(
+    os.environ.get("PASSWORD_RESET_TOKEN_TTL_MINUTES")
+    or PASSWORD_RESET_CONFIG.get("token_ttl_minutes")
+    or 30
+)
 
-# SMTP / email (forgot password) depuis password_reset.config*.json
-SMTP_HOST = str(PASSWORD_RESET_SMTP.get("host") or "").strip()
-SMTP_PORT = int(PASSWORD_RESET_SMTP.get("port") or 587)
-SMTP_USERNAME = str(PASSWORD_RESET_SMTP.get("username") or "").strip()
-SMTP_PASSWORD = str(PASSWORD_RESET_SMTP.get("password") or "")
-SMTP_FROM_EMAIL = str(PASSWORD_RESET_SMTP.get("from_email") or "").strip()
-SMTP_FROM_NAME = str(PASSWORD_RESET_SMTP.get("from_name") or "Kloud").strip()
-SMTP_REPLY_TO = str(PASSWORD_RESET_SMTP.get("reply_to") or "").strip()
-SMTP_USE_TLS = str(PASSWORD_RESET_SMTP.get("use_tls", True)).strip().lower() in {"1", "true", "yes", "on"}
+# SMTP / email : env vars override password_reset.config*.json
+SMTP_HOST = str(os.environ.get("SMTP_HOST") or PASSWORD_RESET_SMTP.get("host") or "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT") or PASSWORD_RESET_SMTP.get("port") or 587)
+SMTP_USERNAME = str(os.environ.get("SMTP_USERNAME") or PASSWORD_RESET_SMTP.get("username") or "").strip()
+SMTP_PASSWORD = str(
+    os.environ.get("RESEND_API_KEY")
+    or os.environ.get("SMTP_PASSWORD")
+    or PASSWORD_RESET_SMTP.get("password")
+    or ""
+)
+SMTP_FROM_EMAIL = str(
+    os.environ.get("SMTP_FROM_EMAIL") or PASSWORD_RESET_SMTP.get("from_email") or ""
+).strip()
+SMTP_FROM_NAME = str(
+    os.environ.get("SMTP_FROM_NAME") or PASSWORD_RESET_SMTP.get("from_name") or "Kloud"
+).strip()
+SMTP_REPLY_TO = str(
+    os.environ.get("SMTP_REPLY_TO") or PASSWORD_RESET_SMTP.get("reply_to") or ""
+).strip()
+SMTP_USE_TLS = str(
+    os.environ.get("SMTP_USE_TLS")
+    if os.environ.get("SMTP_USE_TLS") is not None
+    else PASSWORD_RESET_SMTP.get("use_tls", True)
+).strip().lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -845,9 +869,9 @@ def build_reset_password_url(raw_token: str) -> str:
     return f"{base}{sep}token={raw_token}"
 
 def smtp_configured() -> bool:
-    return bool(SMTP_HOST and SMTP_FROM_EMAIL)
+    return bool(SMTP_FROM_EMAIL and SMTP_PASSWORD and (SMTP_HOST or SMTP_PASSWORD.startswith("re_")))
 
-def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+def _password_reset_email_bodies(*, to_name: Optional[str], reset_url: str) -> tuple[str, str, str]:
     subject = "Réinitialisation de votre mot de passe Kloud"
     recipient_name = (to_name or "").strip() or "there"
     plain_text = (
@@ -865,6 +889,10 @@ def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], res
         "<p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>"
         "<p>— Kloud</p>"
     )
+    return subject, plain_text, html
+
+def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+    subject, plain_text, html = _password_reset_email_bodies(to_name=to_name, reset_url=reset_url)
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -875,12 +903,74 @@ def send_password_reset_email_sync(*, to_email: str, to_name: Optional[str], res
     msg.set_content(plain_text)
     msg.add_alternative(html, subtype="html")
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+    host = SMTP_HOST or "smtp.resend.com"
+    port = SMTP_PORT or 587
+
+    # Port 465 = SMTPS implicite ; 587 = STARTTLS
+    if port in (465, 2465):
+        with smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context()) as smtp:
+            if SMTP_USERNAME:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(msg)
+        return
+
+    with smtplib.SMTP(host, port, timeout=20) as smtp:
+        smtp.ehlo()
         if SMTP_USE_TLS:
             smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
         if SMTP_USERNAME:
             smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
         smtp.send_message(msg)
+
+async def send_password_reset_email_resend_api(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+    """Envoi via l'API HTTP Resend (plus fiable que SMTP derrière certains hébergeurs)."""
+    import aiohttp
+
+    subject, plain_text, html = _password_reset_email_bodies(to_name=to_name, reset_url=reset_url)
+    payload = {
+        "from": f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>",
+        "to": [to_email],
+        "subject": subject,
+        "html": html,
+        "text": plain_text,
+    }
+    if SMTP_REPLY_TO:
+        payload["reply_to"] = SMTP_REPLY_TO
+
+    headers = {
+        "Authorization": f"Bearer {SMTP_PASSWORD}",
+        "Content-Type": "application/json",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.resend.com/emails",
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Resend API {resp.status}: {body[:500]}")
+
+async def send_password_reset_email(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
+    use_resend_api = SMTP_PASSWORD.startswith("re_") or SMTP_USERNAME.lower() == "resend" or (
+        SMTP_HOST or ""
+    ).endswith("resend.com")
+    if use_resend_api:
+        try:
+            await send_password_reset_email_resend_api(
+                to_email=to_email, to_name=to_name, reset_url=reset_url
+            )
+            return
+        except Exception:
+            logger.exception("Resend API failed, falling back to SMTP to=%s", to_email)
+    await asyncio.to_thread(
+        send_password_reset_email_sync,
+        to_email=to_email,
+        to_name=to_name,
+        reset_url=reset_url,
+    )
 
 def ensure_google_oauth_configured():
     if not GOOGLE_OAUTH_CLIENT_ID or not GOOGLE_OAUTH_CLIENT_SECRET or not GOOGLE_OAUTH_REDIRECT_URI:
@@ -1061,11 +1151,17 @@ async def refresh_auth(request: Request, response: Response):
 async def forgot_password(payload: ForgotPasswordRequest):
     """
     Toujours renvoyer un message générique pour éviter l'énumération des emails.
-    En local/dev sans SMTP configuré, on renvoie aussi le token/lien pour faciliter les tests.
+    En local/dev sans SMTP (ou si l'envoi échoue), on renvoie aussi le token/lien pour faciliter les tests.
     """
-    generic_message = "Si cet email existe, un lien de réinitialisation a été généré."
-    user_doc = await db.users.find_one({"email": payload.email}, {"_id": 0})
+    generic_message = "Si cet email existe, un lien de réinitialisation a été envoyé."
+    # Même lookup souple que le login (casse / Gmail dots)
+    user_doc = await find_user_by_email(str(payload.email))
     if not user_doc:
+        return {"message": generic_message}
+
+    if not user_doc.get("password_hash"):
+        # Compte OAuth-only : pas de reset mot de passe email
+        logger.info("password-reset skipped (no password) user_id=%s", user_doc.get("user_id"))
         return {"message": generic_message}
 
     raw_token = secrets.token_urlsafe(32)
@@ -1087,14 +1183,16 @@ async def forgot_password(payload: ForgotPasswordRequest):
     )
 
     reset_url = build_reset_password_url(raw_token)
+    email_sent = False
     if smtp_configured():
         try:
-            await asyncio.to_thread(
-                send_password_reset_email_sync,
+            await send_password_reset_email(
                 to_email=user_doc.get("email", ""),
                 to_name=user_doc.get("name"),
                 reset_url=reset_url,
             )
+            email_sent = True
+            logger.info("password-reset-email-sent user_id=%s to=%s", user_doc["user_id"], user_doc.get("email"))
         except Exception:
             # Ne pas leak d'info côté client (email enum). Journaliser côté serveur.
             logger.exception("password-reset-email-send-failed user_id=%s", user_doc["user_id"])
@@ -1105,13 +1203,16 @@ async def forgot_password(payload: ForgotPasswordRequest):
             reset_url,
         )
 
-    if _app_env != "production" and not smtp_configured():
+    # Dev / échec d'envoi hors prod : lien de secours pour ne pas bloquer
+    if _app_env != "production" and not email_sent:
         return {
             "message": generic_message,
             "reset_token": raw_token,
             "reset_url": reset_url,
             "expires_in_minutes": PASSWORD_RESET_TOKEN_TTL_MINUTES,
+            "email_sent": False,
         }
+    # En production on ne renvoie jamais email_sent (évite l'énumération d'emails)
     return {"message": generic_message}
 
 @api_router.post("/auth/reset-password")
@@ -2551,6 +2652,27 @@ async def update_album(album_id: str, album_data: dict, authorization: Optional[
     updated_album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
     return AlbumResponse(**updated_album)
 
+@api_router.delete("/albums/{album_id}")
+async def delete_album(album_id: str, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+
+    album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+
+    if album["artist_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    track_ids = list(album.get("track_ids") or [])
+    # Supprime les titres rattachés à cet album (création album + liens track_ids)
+    delete_filter = {"$or": [{"album_id": album_id}]}
+    if track_ids:
+        delete_filter["$or"].append({"track_id": {"$in": track_ids}})
+    await db.tracks.delete_many(delete_filter)
+
+    await db.albums.delete_one({"album_id": album_id})
+    return {"message": "Album deleted"}
+
 @api_router.post("/albums/{album_id}/tracks", response_model=AlbumTrackResponse)
 async def create_album_track(album_id: str, track_data: AlbumTrackCreate, authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
@@ -3841,8 +3963,30 @@ async def publish_track(track_id: str, authorization: Optional[str] = Header(Non
         {"track_id": track_id},
         {"$set": {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
-    
     return {"status": new_status, "message": f"Track {'published' if new_status == 'published' else 'unpublished'} successfully"}
+
+@api_router.put("/artist/albums/{album_id}/publish")
+async def publish_album(album_id: str, authorization: Optional[str] = Header(None), request: Request = None):
+    """Toggle album publish status"""
+    user = await get_current_user(authorization, request)
+
+    if user["role"] != "artist":
+        raise HTTPException(status_code=403, detail="Only artists can publish albums")
+
+    album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+
+    if album["artist_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    new_status = "published" if album.get("status") == "draft" else "draft"
+
+    await db.albums.update_one(
+        {"album_id": album_id},
+        {"$set": {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return {"status": new_status, "message": f"Album {'published' if new_status == 'published' else 'unpublished'} successfully"}
 
 @api_router.post("/plays")
 async def record_play(

@@ -22,7 +22,7 @@ import bcrypt
 import jwt
 import shutil
 import asyncio
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from bson import ObjectId
 
 import stripe
@@ -2301,17 +2301,59 @@ async def _seek_grid_out_or_skip(grid_out, position: int) -> None:
         remaining -= len(chunk)
 
 
+def _latin1_filename(name: str) -> str:
+    """HTTP header values are latin-1. Anything else (typographic quotes, emoji) crashes the response."""
+    out = []
+    for ch in name:
+        o = ord(ch)
+        if ch in '"\\' or o < 32 or o == 127:
+            out.append("_")
+        elif o <= 255:
+            out.append(ch)
+        else:
+            out.append("_")
+    cleaned = "".join(out).strip()
+    return cleaned or "track"
+
+
+def _content_disposition_inline(filename: Optional[str], content_type: str) -> str:
+    name = _safe_audio_filename(filename, content_type).replace("\r", " ").replace("\n", " ").replace('"', "")
+    # filename= stays latin-1 for old clients; filename* keeps the real UTF-8 name (RFC 5987).
+    fallback = _latin1_filename(name)
+    encoded = quote(name, safe="")
+    disposition = f"inline; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    try:
+        disposition.encode("latin-1")
+        return disposition
+    except Exception:
+        logger.exception("Unsafe Content-Disposition for audio filename")
+        return 'inline; filename="track"'
+
+
 def _audio_response_headers(content_type: str, filename: Optional[str], extra: Optional[dict] = None) -> dict:
+    safe_type = content_type if isinstance(content_type, str) and content_type else "application/octet-stream"
+    try:
+        safe_type.encode("latin-1")
+    except Exception:
+        safe_type = "application/octet-stream"
     headers = {
         "Accept-Ranges": "bytes",
-        "Content-Type": content_type,
+        "Content-Type": safe_type,
         # no-transform: proxies (Caddy gzip) must not recode the stream — that breaks Range + WAV.
         "Cache-Control": "public, max-age=86400, no-transform",
         "X-Content-Type-Options": "nosniff",
-        "Content-Disposition": f'inline; filename="{_safe_audio_filename(filename, content_type)}"',
+        "Content-Disposition": _content_disposition_inline(filename, safe_type),
     }
     if extra:
-        headers.update(extra)
+        for key, value in extra.items():
+            text = "" if value is None else str(value)
+            try:
+                str(key).encode("latin-1")
+                text.encode("latin-1")
+            except Exception:
+                logger.exception("Dropping non-latin1 audio header %s", key)
+                continue
+            headers[str(key)] = text
     return headers
 
 
@@ -2366,8 +2408,7 @@ async def upload_cover(file: UploadFile = File(...), authorization: Optional[str
 
     return {"cover_url": f"/api/files/covers/{str(file_id)}"}
 
-@api_router.get("/files/audio/{file_id}")
-async def get_audio_file(file_id: str, request: Request):
+async def _stream_audio_file(file_id: str, request: Request):
     try:
         oid = ObjectId(file_id)
     except Exception:
@@ -2450,6 +2491,17 @@ async def get_audio_file(file_id: str, request: Request):
             {"Content-Length": str(file_size)},
         ),
     )
+
+
+@api_router.get("/files/audio/{file_id}")
+async def get_audio_file(file_id: str, request: Request):
+    try:
+        return await _stream_audio_file(file_id, request)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to serve audio file_id=%s", file_id)
+        raise HTTPException(status_code=500, detail="Audio file could not be served")
 
 @api_router.get("/files/covers/{file_id}")
 async def get_cover_file(file_id: str):

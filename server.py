@@ -690,6 +690,7 @@ class UserSettings(BaseModel):
     notifications_new_releases: bool = True
     notifications_recommendations: bool = True
     notifications_purchases: bool = True
+    notifications_likes: bool = True
     privacy_share_listening_activity: bool = False
     privacy_personalized_ads: bool = False
 
@@ -2582,6 +2583,7 @@ async def create_track(track_data: TrackCreate, authorization: Optional[str] = H
     }
     
     await db.tracks.insert_one(track_doc)
+    await _safe_notify(maybe_notify_published("track", None, track_doc))
     return TrackResponse(**track_doc)
 
 @api_router.get("/tracks", response_model=List[TrackResponse])
@@ -2623,9 +2625,11 @@ async def update_track(track_id: str, track_data: dict, authorization: Optional[
     if track["artist_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    previous_status = track.get("status")
     await db.tracks.update_one({"track_id": track_id}, {"$set": track_data})
     
     updated_track = await db.tracks.find_one({"track_id": track_id}, {"_id": 0})
+    await _safe_notify(maybe_notify_published("track", previous_status, updated_track))
     return TrackResponse(**updated_track)
 
 @api_router.delete("/tracks/{track_id}")
@@ -2674,6 +2678,7 @@ async def create_album(album_data: AlbumCreate, authorization: Optional[str] = H
     }
     
     await db.albums.insert_one(album_doc)
+    await _safe_notify(maybe_notify_published("album", None, album_doc))
     return AlbumResponse(**album_doc)
 
 @api_router.get("/albums", response_model=List[AlbumResponse])
@@ -2699,9 +2704,11 @@ async def update_album(album_id: str, album_data: dict, authorization: Optional[
     if album["artist_id"] != user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    previous_status = album.get("status")
     await db.albums.update_one({"album_id": album_id}, {"$set": album_data})
     
     updated_album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
+    await _safe_notify(maybe_notify_published("album", previous_status, updated_album))
     return AlbumResponse(**updated_album)
 
 @api_router.delete("/albums/{album_id}")
@@ -2771,6 +2778,7 @@ async def create_album_track(album_id: str, track_data: AlbumTrackCreate, author
     }
 
     await db.tracks.insert_one(track_doc)
+    await _safe_notify(maybe_notify_published("track", None, track_doc))
 
     # add to album.track_ids
     await db.albums.update_one(
@@ -2794,8 +2802,10 @@ async def update_album_track(album_id: str, track_id: str, payload: dict, author
     if not track:
         raise HTTPException(status_code=404, detail="Track not found in this album")
 
+    previous_status = track.get("status")
     await db.tracks.update_one({"track_id": track_id}, {"$set": payload})
     updated = await db.tracks.find_one({"track_id": track_id}, {"_id": 0})
+    await _safe_notify(maybe_notify_published("track", previous_status, updated))
     return AlbumTrackResponse(**updated)
 
 # ==================== ARTIST ROUTES ====================
@@ -2959,6 +2969,278 @@ async def delete_playlist(playlist_id: str, authorization: Optional[str] = Heade
     await db.playlists.delete_one({"playlist_id": playlist_id})
     return {"message": "Playlist deleted"}
 
+# ==================== NOTIFICATIONS ====================
+
+def _format_eur_from_cents(cents) -> str:
+    try:
+        euros = float(cents or 0) / 100
+    except (TypeError, ValueError):
+        euros = 0.0
+    return f"{euros:.2f}".replace(".", ",") + " €"
+
+
+def _notification_doc(
+    *,
+    user_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    href: str,
+    actor_user_id: Optional[str] = None,
+    actor_name: Optional[str] = None,
+    item_type: Optional[str] = None,
+    item_id: Optional[str] = None,
+    item_title: Optional[str] = None,
+    amount_cents: Optional[float] = None,
+    dedupe_key: Optional[str] = None,
+) -> dict:
+    return {
+        "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
+        "user_id": user_id,
+        "type": kind,
+        "title": title,
+        "body": body,
+        "href": href,
+        "actor_user_id": actor_user_id,
+        "actor_name": actor_name,
+        "item_type": item_type,
+        "item_id": item_id,
+        "item_title": item_title,
+        "amount_cents": amount_cents,
+        "dedupe_key": dedupe_key,
+        "read": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _safe_notify(coro) -> None:
+    try:
+        await coro
+    except Exception:
+        logger.exception("Notification dispatch failed")
+
+
+async def _actor_label(user_id: Optional[str]) -> str:
+    if not user_id:
+        return "Quelqu'un"
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "name": 1, "artist_name": 1})
+    if not user:
+        return "Quelqu'un"
+    name = str(user.get("artist_name") or user.get("name") or "").strip()
+    return name or "Quelqu'un"
+
+
+async def _filter_by_setting(user_ids: List[str], field: str) -> List[str]:
+    if not user_ids:
+        return []
+    docs = await db.user_settings.find(
+        {"user_id": {"$in": user_ids}, field: False},
+        {"_id": 0, "user_id": 1},
+    ).to_list(len(user_ids))
+    blocked = {d.get("user_id") for d in docs}
+    return [uid for uid in user_ids if uid not in blocked]
+
+
+async def _fan_ids_for_artist(artist_id: str) -> List[str]:
+    follows = await db.follows.find({"artist_id": artist_id}, {"_id": 0, "user_id": 1}).to_list(5000)
+    likes = await db.likes.find(
+        {"item_type": "artist", "item_id": artist_id},
+        {"_id": 0, "user_id": 1},
+    ).to_list(5000)
+    seen = set()
+    ids: List[str] = []
+    for doc in follows + likes:
+        uid = doc.get("user_id")
+        if not uid or uid == artist_id or uid in seen:
+            continue
+        seen.add(uid)
+        ids.append(uid)
+    return ids
+
+
+async def notify_item_liked(*, actor_id: str, item_type: str, item_id: str) -> None:
+    href = None
+    artist_id = None
+    item_title = None
+    body = "Like"
+    if item_type == "track":
+        item = await db.tracks.find_one({"track_id": item_id}, {"_id": 0, "title": 1, "artist_id": 1})
+        if not item:
+            return
+        artist_id = item.get("artist_id")
+        item_title = item.get("title") or "un titre"
+        href = f"/track/{item_id}"
+        body = "Like sur un titre"
+    elif item_type == "album":
+        item = await db.albums.find_one({"album_id": item_id}, {"_id": 0, "title": 1, "artist_id": 1})
+        if not item:
+            return
+        artist_id = item.get("artist_id")
+        item_title = item.get("title") or "un album"
+        href = f"/album/{item_id}"
+        body = "Like sur un album"
+    else:
+        artist_id = item_id
+        artist = await db.users.find_one({"user_id": artist_id}, {"_id": 0, "artist_name": 1, "name": 1})
+        if not artist:
+            return
+        item_title = artist.get("artist_name") or artist.get("name") or "ton profil"
+        href = f"/artist/{artist_id}"
+        body = "Like sur ton profil"
+
+    if not artist_id or artist_id == actor_id:
+        return
+    allowed = await _filter_by_setting([artist_id], "notifications_likes")
+    if not allowed:
+        return
+    actor = await _actor_label(actor_id)
+    await db.notifications.insert_one(
+        _notification_doc(
+            user_id=artist_id,
+            kind="like",
+            title=f"{actor} a aimé {item_title}",
+            body=body,
+            href=href,
+            actor_user_id=actor_id,
+            actor_name=actor,
+            item_type=item_type,
+            item_id=item_id,
+            item_title=item_title,
+        )
+    )
+
+
+async def notify_item_acquired(*, buyer_id: str, item_type: str, item_id: str, amount_cents: float) -> None:
+    dedupe_key = f"purchase:{buyer_id}:{item_type}:{item_id}"
+    if await db.notifications.find_one({"dedupe_key": dedupe_key}, {"_id": 1}):
+        return
+    if item_type == "track":
+        item = await db.tracks.find_one({"track_id": item_id}, {"_id": 0, "title": 1, "artist_id": 1})
+        href = f"/track/{item_id}"
+        kind_label = "titre"
+    else:
+        item = await db.albums.find_one({"album_id": item_id}, {"_id": 0, "title": 1, "artist_id": 1})
+        href = f"/album/{item_id}"
+        kind_label = "album"
+    if not item:
+        return
+    artist_id = item.get("artist_id")
+    if not artist_id or artist_id == buyer_id:
+        return
+    allowed = await _filter_by_setting([artist_id], "notifications_purchases")
+    if not allowed:
+        return
+    actor = await _actor_label(buyer_id)
+    item_title = item.get("title") or kind_label
+    try:
+        cents = float(amount_cents or 0)
+    except (TypeError, ValueError):
+        cents = 0.0
+    if cents <= 0:
+        title = f"{actor} a ajouté {item_title}"
+        body = f"Ajout gratuit · {kind_label}"
+    else:
+        title = f"{actor} a acheté {item_title}"
+        body = f"{_format_eur_from_cents(cents)} · {kind_label}"
+    await db.notifications.insert_one(
+        _notification_doc(
+            user_id=artist_id,
+            kind="purchase",
+            title=title,
+            body=body,
+            href=href,
+            actor_user_id=buyer_id,
+            actor_name=actor,
+            item_type=item_type,
+            item_id=item_id,
+            item_title=item_title,
+            amount_cents=cents,
+            dedupe_key=dedupe_key,
+        )
+    )
+
+
+async def notify_new_release(item: dict, item_type: str) -> None:
+    if not item or item.get("status") != "published":
+        return
+    artist_id = item.get("artist_id")
+    if not artist_id:
+        return
+    if item_type == "track":
+        item_id = item.get("track_id")
+        href = f"/track/{item_id}"
+        kind_label = "un titre"
+    else:
+        item_id = item.get("album_id")
+        href = f"/album/{item_id}"
+        kind_label = "un album"
+    if not item_id:
+        return
+    fans = await _filter_by_setting(await _fan_ids_for_artist(artist_id), "notifications_new_releases")
+    if not fans:
+        return
+    artist_name = str(item.get("artist_name") or "").strip() or await _actor_label(artist_id)
+    item_title = item.get("title") or kind_label
+    now = datetime.now(timezone.utc).isoformat()
+    docs = []
+    for uid in fans:
+        doc = _notification_doc(
+            user_id=uid,
+            kind="release",
+            title=f"{artist_name} a sorti {item_title}",
+            body=f"Nouvelle sortie · {kind_label}",
+            href=href,
+            actor_user_id=artist_id,
+            actor_name=artist_name,
+            item_type=item_type,
+            item_id=item_id,
+            item_title=item_title,
+        )
+        doc["created_at"] = now
+        docs.append(doc)
+    if docs:
+        await db.notifications.insert_many(docs)
+
+
+async def maybe_notify_published(item_type: str, previous_status: Optional[str], item: Optional[dict]) -> None:
+    if not item or item.get("status") != "published":
+        return
+    if previous_status == "published":
+        return
+    await notify_new_release(item, item_type)
+
+
+@api_router.get("/notifications")
+async def list_notifications(limit: int = 40, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    limit = max(1, min(int(limit or 40), 100))
+    items = await db.notifications.find(
+        {"user_id": user["user_id"]},
+        {"_id": 0},
+    ).sort("created_at", -1).limit(limit).to_list(limit)
+    unread_count = await db.notifications.count_documents({"user_id": user["user_id"], "read": False})
+    return {"items": items, "unread_count": unread_count}
+
+
+@api_router.post("/notifications/read-all")
+async def mark_all_notifications_read(authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    await db.notifications.update_many(
+        {"user_id": user["user_id"], "read": False},
+        {"$set": {"read": True}},
+    )
+    return {"ok": True}
+
+
+@api_router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    await db.notifications.update_one(
+        {"notification_id": notification_id, "user_id": user["user_id"]},
+        {"$set": {"read": True}},
+    )
+    return {"ok": True}
+
 # ==================== LIKES ROUTES ====================
 
 @api_router.post("/likes")
@@ -2990,6 +3272,8 @@ async def add_like(like_data: LikeRequest, authorization: Optional[str] = Header
         await db.albums.update_one({"album_id": like_data.item_id}, {"$inc": {"likes_count": 1}})
     else:
         await db.users.update_one({"user_id": like_data.item_id, "role": "artist"}, {"$inc": {"likes_count": 1}})
+
+    await _safe_notify(notify_item_liked(actor_id=user["user_id"], item_type=like_data.item_type, item_id=like_data.item_id))
     
     return {"message": "Liked"}
 
@@ -3355,6 +3639,12 @@ async def get_checkout_status(session_id: str, authorization: Optional[str] = He
                     status_code=500,
                     detail=f"Enregistrement de l'achat impossible: {e!s}",
                 )
+            await _safe_notify(notify_item_acquired(
+                buyer_id=transaction["user_id"],
+                item_type=item_type,
+                item_id=item_id,
+                amount_cents=price_paid,
+            ))
 
         await log_transaction_event(
             kind="checkout_paid",
@@ -3435,6 +3725,12 @@ async def add_to_library(payload: AddToLibraryRequest, authorization: Optional[s
         "purchased_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.purchases.insert_one(purchase_doc)
+    await _safe_notify(notify_item_acquired(
+        buyer_id=user["user_id"],
+        item_type=payload.item_type,
+        item_id=payload.item_id,
+        amount_cents=0,
+    ))
     await log_transaction_event(
         kind="library_add_free",
         data={
@@ -3613,6 +3909,12 @@ async def fulfill_checkout_session_completed(sess) -> None:
                     "seller_net_cents": seller_net_pub,
                 }
                 await db.purchases.insert_one(purchase_doc)
+                await _safe_notify(notify_item_acquired(
+                    buyer_id=user_id,
+                    item_type=item_type,
+                    item_id=item_id,
+                    amount_cents=price_paid or 0,
+                ))
 
         await log_transaction_event(
             kind="checkout_completed",
@@ -4015,6 +4317,7 @@ async def publish_track(track_id: str, authorization: Optional[str] = Header(Non
         {"track_id": track_id},
         {"$set": {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
+    await _safe_notify(maybe_notify_published("track", track.get("status"), {**track, "status": new_status}))
     return {"status": new_status, "message": f"Track {'published' if new_status == 'published' else 'unpublished'} successfully"}
 
 @api_router.put("/artist/albums/{album_id}/publish")
@@ -4038,6 +4341,7 @@ async def publish_album(album_id: str, authorization: Optional[str] = Header(Non
         {"album_id": album_id},
         {"$set": {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
+    await _safe_notify(maybe_notify_published("album", album.get("status"), {**album, "status": new_status}))
     return {"status": new_status, "message": f"Album {'published' if new_status == 'published' else 'unpublished'} successfully"}
 
 @api_router.post("/plays")

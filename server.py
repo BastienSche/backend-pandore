@@ -31,6 +31,7 @@ from bson import ObjectId
 
 import stripe
 from pymongo import ReturnDocument
+from artist_analytics import AnalyticsHeartbeat, collect_artist_analytics, ensure_analytics_indexes, record_heartbeat
 from stripe_payments import (
     compute_platform_fee_cents,
     create_account_login_link,
@@ -5476,6 +5477,34 @@ async def get_artist_stats(authorization: Optional[str] = Header(None), request:
         "top_tracks": top_tracks,
     }
 
+
+@api_router.post("/analytics/heartbeat")
+async def analytics_heartbeat(
+    payload: AnalyticsHeartbeat,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = None
+    try:
+        user = await get_current_user(authorization, request)
+    except HTTPException:
+        user = None
+    await record_heartbeat(db, payload, request, user)
+    return {"ok": True}
+
+
+@api_router.get("/artist/analytics")
+async def artist_analytics(
+    days: int = 30,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    if user.get("role") != "artist":
+        raise HTTPException(status_code=403, detail="Only artists can view stats")
+    return await collect_artist_analytics(db, user["user_id"], days)
+
+
 @api_router.get("/artist/tracks")
 async def get_artist_tracks(authorization: Optional[str] = Header(None), request: Request = None):
     """Get all tracks for the logged-in artist"""
@@ -5690,6 +5719,7 @@ async def sync_admin_emails_on_startup():
         SMTP_HOST or "-",
     )
     asyncio.create_task(_backfill_audio_previews())
+    asyncio.create_task(ensure_analytics_indexes(db))
     if not wanted:
         return
     try:

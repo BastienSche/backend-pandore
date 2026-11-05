@@ -1745,24 +1745,24 @@ async def update_role(new_role: str, artist_name: Optional[str] = None, authoriz
     if new_role not in allowed:
         raise HTTPException(status_code=400, detail="Invalid role")
     
-    # Si on passe en mode artist et qu'on a déjà un artist_name, le garder
-    if new_role == "artist":
-        # Si pas de nouveau nom fourni, garder l'ancien s'il existe
-        if not artist_name and user.get("artist_name"):
-            artist_name = user["artist_name"]
-        elif not artist_name:
-            raise HTTPException(status_code=400, detail="Artist name required for artist role")
-    
+    kept_name = str(artist_name or user.get("artist_name") or "").strip() or None
+    if new_role == "artist" and not kept_name:
+        raise HTTPException(status_code=400, detail="Artist name required for artist role")
+
     await db.users.update_one(
         {"user_id": user["user_id"]},
         {"$set": {
             "role": new_role,
-            "artist_name": artist_name if new_role == "artist" else user.get("artist_name"),
+            "artist_name": kept_name or user.get("artist_name"),
             "is_admin": user_is_admin(user),
         }}
     )
-    
-    return {"role": new_role, "artist_name": artist_name, "is_admin": user_is_admin(user)}
+
+    return {
+        "role": new_role,
+        "artist_name": kept_name or user.get("artist_name"),
+        "is_admin": user_is_admin(user),
+    }
 
 # ==================== ADMIN ROUTES ====================
 
@@ -2440,6 +2440,11 @@ async def create_artist_profile(profile_data: ArtistProfileCreate, authorization
     }
     
     await db.artist_profiles.insert_one(profile_doc)
+    if profile_data.name:
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"artist_name": profile_data.name}},
+        )
     return ArtistProfileResponse(**profile_doc)
 
 @api_router.get("/artist/profile", response_model=ArtistProfileResponse)
@@ -2472,12 +2477,22 @@ async def update_artist_profile(profile_data: ArtistProfileCreate, authorization
             **update_data,
         }
         await db.artist_profiles.insert_one(profile_doc)
+        if update_data.get("name"):
+            await db.users.update_one(
+                {"user_id": user["user_id"]},
+                {"$set": {"artist_name": update_data["name"]}},
+            )
         return ArtistProfileResponse(**profile_doc)
 
     await db.artist_profiles.update_one(
         {"user_id": user["user_id"]},
         {"$set": update_data},
     )
+    if update_data.get("name"):
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"artist_name": update_data["name"]}},
+        )
     profile = await db.artist_profiles.find_one({"user_id": user["user_id"]}, {"_id": 0})
     if not profile:
         raise HTTPException(status_code=500, detail="Profil artiste introuvable")

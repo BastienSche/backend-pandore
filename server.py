@@ -1039,9 +1039,7 @@ def _resend_key_rejected(exc: BaseException) -> bool:
 
 
 async def send_password_reset_email(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
-    use_resend_api = SMTP_PASSWORD.startswith("re_") or SMTP_USERNAME.lower() == "resend" or (
-        SMTP_HOST or ""
-    ).endswith("resend.com")
+    use_resend_api = SMTP_PASSWORD.startswith("re_") or (SMTP_HOST or "").endswith("resend.com")
     if use_resend_api:
         try:
             await send_password_reset_email_resend_api(
@@ -5316,7 +5314,13 @@ async def search(q: str, types: str = "tracks,albums,artists", limit: int = 20):
 @app.get("/health")
 async def health_check():
     """Ping public (prod / navigateur), sans JWT."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "mail_configured": smtp_configured(),
+        "mail_host": SMTP_HOST or "",
+        "mail_from": SMTP_FROM_EMAIL or "",
+        "mail_port": SMTP_PORT,
+    }
 
 # Include router
 app.include_router(api_router)

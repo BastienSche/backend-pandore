@@ -189,8 +189,13 @@ async def record_heartbeat(db, payload: AnalyticsHeartbeat, request, user: Optio
         }
     await db.analytics_sessions.update_one({"session_id": payload.session_id}, ops, upsert=True)
 
+    hour = payload.local_hour if payload.local_hour is not None else now.hour
+    await db.analytics_hours.update_one(
+        {"artist_id": "_all", "day": _day_key(now), "hour": int(hour)},
+        {"$inc": {"visits": 1, "dwell_sec": dwell}, "$set": {"updated_at": now_iso}},
+        upsert=True,
+    )
     if artist_id:
-        hour = payload.local_hour if payload.local_hour is not None else now.hour
         await db.analytics_hours.update_one(
             {"artist_id": artist_id, "day": _day_key(now), "hour": int(hour)},
             {"$inc": {"visits": 1, "dwell_sec": dwell}, "$set": {"updated_at": now_iso}},
@@ -198,55 +203,58 @@ async def record_heartbeat(db, payload: AnalyticsHeartbeat, request, user: Optio
         )
 
 
-async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
+async def collect_site_analytics(db, days: int = 30) -> dict:
+    """Stats globales Kloud — admin / dev uniquement."""
     days = max(MIN_DAYS, min(MAX_DAYS, int(days or 30)))
     day_keys = _date_range(days)
     start_iso = f"{day_keys[0]}T00:00:00+00:00"
     live_after = (_now() - timedelta(seconds=LIVE_WINDOW_SEC)).isoformat()
 
-    tracks = await db.tracks.find({"artist_id": artist_id}, {"_id": 0, "track_id": 1, "title": 1}).to_list(2000)
-    albums = await db.albums.find({"artist_id": artist_id}, {"_id": 0, "album_id": 1, "title": 1}).to_list(1000)
-    track_ids = [t["track_id"] for t in tracks if t.get("track_id")]
-    album_ids = [a["album_id"] for a in albums if a.get("album_id")]
-    track_title = {t["track_id"]: t.get("title") or t["track_id"] for t in tracks}
-
-    purchase_or = []
-    if track_ids:
-        purchase_or.append({"item_type": "track", "item_id": {"$in": track_ids}})
-    if album_ids:
-        purchase_or.append({"item_type": "album", "item_id": {"$in": album_ids}})
-
-    like_or = [{"item_type": "artist", "item_id": artist_id}]
-    if track_ids:
-        like_or.append({"item_type": "track", "item_id": {"$in": track_ids}})
-    if album_ids:
-        like_or.append({"item_type": "album", "item_id": {"$in": album_ids}})
+    tracks = await db.tracks.find({}, {"_id": 0, "track_id": 1, "title": 1}).to_list(8000)
+    track_title = {t["track_id"]: t.get("title") or t["track_id"] for t in tracks if t.get("track_id")}
 
     plays = await db.plays.find(
-        {"track_id": {"$in": track_ids}} if track_ids else {"track_id": "__none__"},
+        {},
         {"_id": 0, "track_id": 1, "user_id": 1, "played_at": 1, "duration_sec": 1},
-    ).to_list(80000) if track_ids else []
-    likes = await db.likes.find({"$or": like_or}, {"_id": 0, "user_id": 1, "item_type": 1, "item_id": 1, "created_at": 1}).to_list(20000)
-    follows = await db.follows.find({"artist_id": artist_id}, {"_id": 0, "user_id": 1, "created_at": 1}).to_list(20000)
-    purchases = await db.purchases.find({"$or": purchase_or}, {"_id": 0}).to_list(20000) if purchase_or else []
+    ).to_list(80000)
+    likes = await db.likes.find({}, {"_id": 0, "user_id": 1, "item_type": 1, "created_at": 1}).to_list(40000)
+    follows = await db.follows.find({}, {"_id": 0, "user_id": 1, "created_at": 1}).to_list(40000)
+    purchases = await db.purchases.find({}, {"_id": 0}).to_list(40000)
+    users = await db.users.find(
+        {},
+        {"_id": 0, "user_id": 1, "role": 1, "is_admin": 1, "created_at": 1},
+    ).to_list(40000)
 
     sessions = await db.analytics_sessions.find(
-        {"artist_ids": artist_id, "last_seen": {"$gte": start_iso}},
+        {"last_seen": {"$gte": start_iso}},
         {"_id": 0},
-    ).to_list(20000)
+    ).to_list(40000)
     live_sessions = await db.analytics_sessions.find(
-        {"last_artist_id": artist_id, "last_seen": {"$gte": live_after}},
-        {"_id": 0},
-    ).to_list(2000)
-    hour_docs = await db.analytics_hours.find(
-        {"artist_id": artist_id, "day": {"$gte": day_keys[0]}},
+        {"last_seen": {"$gte": live_after}},
         {"_id": 0},
     ).to_list(4000)
+    hour_docs = await db.analytics_hours.find(
+        {"artist_id": "_all", "day": {"$gte": day_keys[0]}},
+        {"_id": 0},
+    ).to_list(4000)
+    if not hour_docs:
+        hour_docs = await db.analytics_hours.find({"day": {"$gte": day_keys[0]}}, {"_id": 0}).to_list(8000)
 
     paid = [p for p in purchases if _purchase_cents(p) > 0]
+    artists_n = sum(1 for u in users if u.get("role") == "artist")
+    admins_n = sum(1 for u in users if u.get("is_admin"))
 
     daily = {
-        d: {"plays": 0, "likes": 0, "follows": 0, "purchases": 0, "revenue_cents": 0, "visitors": 0, "dwell_sec": 0}
+        d: {
+            "plays": 0,
+            "likes": 0,
+            "follows": 0,
+            "purchases": 0,
+            "revenue_cents": 0,
+            "visitors": 0,
+            "dwell_sec": 0,
+            "signups": 0,
+        }
         for d in day_keys
     }
 
@@ -264,6 +272,7 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
     add_daily(likes, "created_at", "likes")
     add_daily(follows, "created_at", "follows")
     add_daily(paid, "purchased_at", "purchases", lambda p: int(round(_purchase_cents(p))))
+    add_daily(users, "created_at", "signups")
 
     for sess in sessions:
         day = str(sess.get("started_at") or sess.get("last_seen") or "")[:10]
@@ -273,10 +282,9 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
         slot["visitors"] += 1
         slot["dwell_sec"] += int(sess.get("dwell_sec") or 0)
 
-    live_filtered = [s for s in live_sessions if s.get("user_id") != artist_id]
-    live_logged = sum(1 for s in live_filtered if s.get("user_id"))
-    path_counts = Counter(_clean_path(s.get("path")) for s in live_filtered)
-    region_live = Counter(_region_label(s.get("country"), s.get("timezone")) for s in live_filtered)
+    live_logged = sum(1 for s in live_sessions if s.get("user_id"))
+    path_counts = Counter(_clean_path(s.get("path")) for s in live_sessions)
+    region_live = Counter(_region_label(s.get("country"), s.get("timezone")) for s in live_sessions)
 
     dwells = [float(s.get("dwell_sec") or 0) for s in sessions]
     logged_sessions = sum(1 for s in sessions if s.get("user_id"))
@@ -289,7 +297,7 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
         if 0 <= h <= 23:
             hours[h] += int(doc.get("visits") or 0)
             hours_dwell[h] += int(doc.get("dwell_sec") or 0)
-    if not hour_docs:
+    if not any(hours.values()):
         for play in plays:
             dt = _parse_dt(play.get("played_at"))
             if dt:
@@ -303,11 +311,16 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
 
     region_sessions = Counter(_region_label(s.get("country"), s.get("timezone")) for s in sessions)
     locale_sessions = Counter((s.get("locale") or "inconnue")[:12] for s in sessions)
+    roles = Counter(
+        "Admin" if u.get("is_admin") else ("Artiste" if u.get("role") == "artist" else "Auditeur")
+        for u in users
+    )
 
     listeners = {p.get("user_id") for p in plays if p.get("user_id")}
     likers = {lk.get("user_id") for lk in likes if lk.get("user_id")}
     followers = {f.get("user_id") for f in follows if f.get("user_id")}
     buyers = {p.get("user_id") for p in paid if p.get("user_id")}
+    registered = {u.get("user_id") for u in users if u.get("user_id")}
     buyer_counts = Counter(p.get("user_id") for p in paid if p.get("user_id"))
     repeat_buyers = sum(1 for _, n in buyer_counts.items() if n >= 2)
 
@@ -338,10 +351,10 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
     play_track_counts = Counter(p.get("track_id") for p in plays if p.get("track_id"))
     top_tracks = [
         {"track_id": tid, "title": track_title.get(tid, tid), "plays": n}
-        for tid, n in play_track_counts.most_common(6)
+        for tid, n in play_track_counts.most_common(8)
     ]
 
-    recent = sorted(sessions, key=lambda s: s.get("last_seen") or "", reverse=True)[:18]
+    recent = sorted(sessions, key=lambda s: s.get("last_seen") or "", reverse=True)[:25]
     recent_visitors = [
         {
             "when": s.get("last_seen"),
@@ -350,10 +363,10 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
             "region": _region_label(s.get("country"), s.get("timezone")),
             "timezone": s.get("timezone"),
             "logged_in": bool(s.get("user_id")),
+            "user_id": s.get("user_id"),
             "dwell_sec": int(s.get("dwell_sec") or 0),
         }
         for s in recent
-        if s.get("user_id") != artist_id
     ]
 
     weekday_labels = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
@@ -362,11 +375,11 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
         "range_days": days,
         "generated_at": _now_iso(),
         "live": {
-            "visitors": len(live_filtered),
+            "visitors": len(live_sessions),
             "logged_in": live_logged,
-            "guests": len(live_filtered) - live_logged,
-            "by_path": [{"name": k or "/", "value": v} for k, v in path_counts.most_common(8)],
-            "by_region": [{"name": k, "value": v} for k, v in region_live.most_common(8)],
+            "guests": len(live_sessions) - live_logged,
+            "by_path": [{"name": k or "/", "value": v} for k, v in path_counts.most_common(10)],
+            "by_region": [{"name": k, "value": v} for k, v in region_live.most_common(10)],
         },
         "engagement": {
             "sessions": len(sessions),
@@ -376,6 +389,13 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
             "median_session_sec": round(_median(dwells), 1),
             "total_dwell_sec": int(sum(dwells)),
         },
+        "accounts": {
+            "users": len(users),
+            "artists": artists_n,
+            "admins": admins_n,
+            "listeners": max(0, len(users) - artists_n),
+        },
+        "roles": [{"name": k, "value": v} for k, v in roles.most_common()],
         "daily": [
             {
                 "day": d,
@@ -389,7 +409,8 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
         "regions": [{"name": k, "value": v} for k, v in region_sessions.most_common(10)],
         "locales": [{"name": k, "value": v} for k, v in locale_sessions.most_common(8)],
         "funnel": [
-            {"step": "Auditeurs connectés", "n": len(listeners)},
+            {"step": "Comptes", "n": len(registered)},
+            {"step": "Auditeurs actifs", "n": len(listeners)},
             {"step": "Likes", "n": len(likers)},
             {"step": "Follows", "n": len(followers)},
             {"step": "Acheteurs", "n": len(buyers)},
@@ -404,6 +425,7 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
             "play_to_follow_pct": _pct(len(listeners & followers), len(listeners)),
             "play_to_buy_pct": _pct(len(listeners & buyers), len(listeners)),
             "like_to_buy_pct": _pct(len(likers & buyers), len(likers)),
+            "signup_to_buy_pct": _pct(len(registered & buyers), len(registered)),
             "repeat_buyer_pct": _pct(repeat_buyers, len(buyers)),
             "repeat_buyers": repeat_buyers,
             "avg_days_to_purchase": round(sum(delays) / len(delays), 1) if delays else None,
@@ -414,6 +436,7 @@ async def collect_artist_analytics(db, artist_id: str, days: int = 30) -> dict:
             "follows": len(follows),
             "purchases": len(paid),
             "revenue_cents": int(round(sum(_purchase_cents(p) for p in paid))),
+            "signups": len(users),
         },
         "top_tracks": top_tracks,
         "recent_visitors": recent_visitors,

@@ -31,7 +31,7 @@ from bson import ObjectId
 
 import stripe
 from pymongo import ReturnDocument
-from artist_analytics import AnalyticsHeartbeat, collect_artist_analytics, ensure_analytics_indexes, record_heartbeat
+from artist_analytics import AnalyticsHeartbeat, collect_site_analytics, ensure_analytics_indexes, record_heartbeat
 from stripe_payments import (
     compute_platform_fee_cents,
     create_account_login_link,
@@ -5493,16 +5493,15 @@ async def analytics_heartbeat(
     return {"ok": True}
 
 
-@api_router.get("/artist/analytics")
-async def artist_analytics(
+@api_router.get("/admin/analytics")
+async def admin_analytics(
     days: int = 30,
     authorization: Optional[str] = Header(None),
     request: Request = None,
 ):
     user = await get_current_user(authorization, request)
-    if user.get("role") != "artist":
-        raise HTTPException(status_code=403, detail="Only artists can view stats")
-    return await collect_artist_analytics(db, user["user_id"], days)
+    require_admin(user)
+    return await collect_site_analytics(db, days)
 
 
 @api_router.get("/artist/tracks")

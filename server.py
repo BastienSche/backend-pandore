@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form, Request, Header, Response, Query
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
@@ -32,6 +32,14 @@ from bson import ObjectId
 import stripe
 from pymongo import ReturnDocument
 from artist_analytics import AnalyticsHeartbeat, collect_site_analytics, ensure_analytics_indexes, record_heartbeat
+from share_preview import (
+    absolute_url,
+    allowed_share_target,
+    normalize_smart_links,
+    og_html,
+    public_origin,
+    qr_svg_response,
+)
 from stripe_payments import (
     compute_platform_fee_cents,
     create_account_login_link,
@@ -753,12 +761,18 @@ class LikeRequest(BaseModel):
 class LikesStateResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+class SmartLink(BaseModel):
+    kind: str = "website"
+    url: str
+    label: Optional[str] = ""
+
 class ArtistProfileCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     name: str = Field(..., validation_alias=AliasChoices("name", "artist_name"))
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
-    links: Optional[List[str]] = None
+    links: Optional[List[Any]] = None
+    genres: Optional[List[str]] = None
 
 class ArtistProfileResponse(BaseModel):
     profile_id: str
@@ -766,7 +780,8 @@ class ArtistProfileResponse(BaseModel):
     name: str
     bio: Optional[str]
     avatar_url: Optional[str]
-    links: Optional[List[str]]
+    links: Optional[List[SmartLink]] = None
+    genres: Optional[List[str]] = None
     created_at: str
     updated_at: str
 
@@ -2411,6 +2426,18 @@ async def get_contest_detail(contest_id: str, limit: int = Query(50, ge=1, le=20
     }
 
 
+def _profile_doc_for_response(profile: dict) -> dict:
+    doc = dict(profile or {})
+    doc["links"] = normalize_smart_links(doc.get("links"))
+    genres = doc.get("genres") or []
+    if isinstance(genres, str):
+        genres = [g.strip() for g in re.split(r"[,;/]+", genres) if g.strip()]
+    elif not isinstance(genres, list):
+        genres = []
+    doc["genres"] = [str(g).strip() for g in genres if str(g).strip()]
+    return doc
+
+
 # ==================== ARTIST PROFILE ROUTES ====================
 
 @api_router.post("/artist/profile", response_model=ArtistProfileResponse)
@@ -2434,7 +2461,8 @@ async def create_artist_profile(profile_data: ArtistProfileCreate, authorization
         "name": profile_data.name,
         "bio": profile_data.bio,
         "avatar_url": profile_data.avatar_url,
-        "links": profile_data.links or [],
+        "links": normalize_smart_links(profile_data.links),
+        "genres": [str(g).strip() for g in (profile_data.genres or []) if str(g).strip()],
         "created_at": now,
         "updated_at": now
     }
@@ -2445,7 +2473,7 @@ async def create_artist_profile(profile_data: ArtistProfileCreate, authorization
             {"user_id": user["user_id"]},
             {"$set": {"artist_name": profile_data.name}},
         )
-    return ArtistProfileResponse(**profile_doc)
+    return ArtistProfileResponse(**_profile_doc_for_response(profile_doc))
 
 @api_router.get("/artist/profile", response_model=ArtistProfileResponse)
 async def get_my_artist_profile(authorization: Optional[str] = Header(None), request: Request = None):
@@ -2455,7 +2483,7 @@ async def get_my_artist_profile(authorization: Optional[str] = Header(None), req
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
     
-    return ArtistProfileResponse(**profile)
+    return ArtistProfileResponse(**_profile_doc_for_response(profile))
 
 @api_router.put("/artist/profile", response_model=ArtistProfileResponse)
 async def update_artist_profile(profile_data: ArtistProfileCreate, authorization: Optional[str] = Header(None), request: Request = None):
@@ -2466,6 +2494,8 @@ async def update_artist_profile(profile_data: ArtistProfileCreate, authorization
     
     now = datetime.now(timezone.utc).isoformat()
     update_data = profile_data.model_dump()
+    update_data["links"] = normalize_smart_links(update_data.get("links"))
+    update_data["genres"] = [str(g).strip() for g in (update_data.get("genres") or []) if str(g).strip()]
     update_data["updated_at"] = now
 
     existing = await db.artist_profiles.find_one({"user_id": user["user_id"]}, {"_id": 0})
@@ -2482,7 +2512,7 @@ async def update_artist_profile(profile_data: ArtistProfileCreate, authorization
                 {"user_id": user["user_id"]},
                 {"$set": {"artist_name": update_data["name"]}},
             )
-        return ArtistProfileResponse(**profile_doc)
+        return ArtistProfileResponse(**_profile_doc_for_response(profile_doc))
 
     await db.artist_profiles.update_one(
         {"user_id": user["user_id"]},
@@ -2496,7 +2526,7 @@ async def update_artist_profile(profile_data: ArtistProfileCreate, authorization
     profile = await db.artist_profiles.find_one({"user_id": user["user_id"]}, {"_id": 0})
     if not profile:
         raise HTTPException(status_code=500, detail="Profil artiste introuvable")
-    return ArtistProfileResponse(**profile)
+    return ArtistProfileResponse(**_profile_doc_for_response(profile))
 
 # ==================== UPLOAD ROUTES ====================
 
@@ -3836,8 +3866,81 @@ async def get_artist(artist_id: str):
         {"_id": 0},
     ).to_list(100)
     artist["albums"] = await _hydrate_album_track_ids(albums)
+
+    profile = await db.artist_profiles.find_one({"user_id": artist_id}, {"_id": 0})
+    if profile:
+        ready = _profile_doc_for_response(profile)
+        artist["bio"] = ready.get("bio") or artist.get("bio")
+        artist["links"] = ready.get("links") or []
+        artist["genres"] = ready.get("genres") or []
+        if ready.get("avatar_url"):
+            artist["avatar_url"] = ready.get("avatar_url")
+    else:
+        artist["links"] = []
+        artist["genres"] = []
     
     return artist
+
+# ==================== SHARE / OPEN GRAPH ====================
+
+@api_router.get("/og/track/{track_id}", response_class=HTMLResponse)
+async def og_track(track_id: str, request: Request):
+    track = await db.tracks.find_one({"track_id": track_id, "status": {"$ne": "draft"}}, {"_id": 0})
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    origin = public_origin(request)
+    title = f"{track.get('title') or 'Titre'} — {track.get('artist_name') or 'Kloud'}"
+    desc = (track.get("description") or track.get("genre") or "Écoute le preview et achète sur Kloud.")
+    return og_html(
+        title=title,
+        description=str(desc),
+        url=f"{origin}/track/{track_id}",
+        image=absolute_url(track.get("cover_url"), request),
+        og_type="music.song",
+    )
+
+
+@api_router.get("/og/artist/{artist_id}", response_class=HTMLResponse)
+async def og_artist(artist_id: str, request: Request):
+    artist = await db.users.find_one({"user_id": artist_id, "role": "artist"}, {"_id": 0, "password_hash": 0})
+    if not artist:
+        raise HTTPException(status_code=404, detail="Artist not found")
+    await _apply_custom_avatars([artist])
+    profile = await db.artist_profiles.find_one({"user_id": artist_id}, {"_id": 0}) or {}
+    origin = public_origin(request)
+    name = artist.get("artist_name") or artist.get("name") or "Artiste"
+    desc = profile.get("bio") or f"Écoute {name} sur Kloud."
+    image = profile.get("avatar_url") or artist.get("picture")
+    return og_html(
+        title=f"{name} — Kloud",
+        description=str(desc),
+        url=f"{origin}/artist/{artist_id}",
+        image=absolute_url(image, request),
+        og_type="profile",
+    )
+
+
+@api_router.get("/og/album/{album_id}", response_class=HTMLResponse)
+async def og_album(album_id: str, request: Request):
+    album = await db.albums.find_one({"album_id": album_id, "status": {"$ne": "draft"}}, {"_id": 0})
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+    origin = public_origin(request)
+    title = f"{album.get('title') or 'Album'} — {album.get('artist_name') or 'Kloud'}"
+    desc = album.get("description") or "Écoute et achète cet album sur Kloud."
+    return og_html(
+        title=title,
+        description=str(desc),
+        url=f"{origin}/album/{album_id}",
+        image=absolute_url(album.get("cover_url"), request),
+        og_type="music.album",
+    )
+
+
+@api_router.get("/share/qr.svg")
+async def share_qr(u: str, request: Request):
+    target = allowed_share_target(u, request)
+    return qr_svg_response(target)
 
 # ==================== PLAYLIST ROUTES ====================
 

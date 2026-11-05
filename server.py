@@ -372,7 +372,7 @@ async def compute_contest_standings(
 
     profiles = await db.artist_profiles.find(
         {"user_id": {"$in": artist_ids}},
-        {"_id": 0, "user_id": 1, "genres": 1, "genre": 1},
+        {"_id": 0, "user_id": 1, "genres": 1, "genre": 1, "avatar_url": 1},
     ).to_list(len(artist_ids))
     genres_by_id = {p["user_id"]: p for p in profiles}
 
@@ -392,7 +392,7 @@ async def compute_contest_standings(
                 "rank": idx,
                 "artist_id": aid,
                 "artist_name": u.get("artist_name") or u.get("name") or "Artiste",
-                "picture": u.get("picture"),
+                "picture": _custom_avatar_url(gdoc.get("avatar_url"), u.get("picture")),
                 "genre": genre_label or None,
                 "revenue_cents": int(round(cents)),
             }
@@ -2810,9 +2810,34 @@ async def update_album_track(album_id: str, track_id: str, payload: dict, author
 
 # ==================== ARTIST ROUTES ====================
 
+def _custom_avatar_url(*candidates) -> Optional[str]:
+    """URL choisi par l’artiste. Les masques par défaut restent côté front."""
+    for raw in candidates:
+        value = str(raw or "").strip()
+        if value and "/avatars/mask-" not in value:
+            return value
+    return None
+
+
+async def _apply_custom_avatars(artists: list) -> None:
+    ids = [a.get("user_id") for a in artists if a.get("user_id")]
+    if not ids:
+        return
+    profiles = await db.artist_profiles.find(
+        {"user_id": {"$in": ids}},
+        {"_id": 0, "user_id": 1, "avatar_url": 1},
+    ).to_list(len(ids))
+    by_id = {p["user_id"]: p for p in profiles}
+    for artist in artists:
+        profile = by_id.get(artist.get("user_id")) or {}
+        custom = _custom_avatar_url(profile.get("avatar_url"), artist.get("picture"))
+        artist["avatar_url"] = profile.get("avatar_url") or None
+        artist["picture"] = custom
+
 @api_router.get("/artists")
 async def get_artists(limit: int = 50):
     artists = await db.users.find({"role": "artist"}, {"_id": 0, "password_hash": 0}).limit(limit).to_list(limit)
+    await _apply_custom_avatars(artists)
     return artists
 
 @api_router.get("/artists/{artist_id}")
@@ -2820,6 +2845,8 @@ async def get_artist(artist_id: str):
     artist = await db.users.find_one({"user_id": artist_id, "role": "artist"}, {"_id": 0, "password_hash": 0})
     if not artist:
         raise HTTPException(status_code=404, detail="Artist not found")
+
+    await _apply_custom_avatars([artist])
     
     # Get artist's tracks
     tracks = await db.tracks.find({"artist_id": artist_id}, {"_id": 0}).to_list(100)
@@ -3339,11 +3366,13 @@ async def get_likes_summary(limit: int = 200, authorization: Optional[str] = Hea
     track_by_id = {t["track_id"]: t for t in tracks}
     album_by_id = {a["album_id"]: a for a in albums}
     artist_by_id = {a["user_id"]: a for a in artists}
+    liked_artists = [artist_by_id[i] for i in artist_ids if i in artist_by_id]
+    await _apply_custom_avatars(liked_artists)
 
     return {
         "tracks": [track_by_id[i] for i in track_ids if i in track_by_id],
         "albums": [album_by_id[i] for i in album_ids if i in album_by_id],
-        "artists": [artist_by_id[i] for i in artist_ids if i in artist_by_id],
+        "artists": liked_artists,
     }
 
 # ==================== PURCHASE ROUTES ====================
@@ -3805,7 +3834,9 @@ async def get_my_follows(limit: int = 200, authorization: Optional[str] = Header
     artist_ids = [f["artist_id"] for f in follows]
     artists = await db.users.find({"user_id": {"$in": artist_ids}, "role": "artist"}, {"_id": 0, "password_hash": 0}).to_list(len(artist_ids))
     by_id = {a["user_id"]: a for a in artists}
-    return [by_id[i] for i in artist_ids if i in by_id]
+    ordered = [by_id[i] for i in artist_ids if i in by_id]
+    await _apply_custom_avatars(ordered)
+    return ordered
 
 @api_router.get("/follows/state")
 async def get_follow_state(artist_ids: str, authorization: Optional[str] = Header(None), request: Request = None):

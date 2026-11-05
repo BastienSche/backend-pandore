@@ -30,12 +30,15 @@ from urllib.parse import quote, urlencode
 from bson import ObjectId
 
 import stripe
+from pymongo import ReturnDocument
 from stripe_payments import (
     compute_platform_fee_cents,
     create_account_login_link,
     create_account_onboarding_link,
     create_checkout_session,
+    create_connect_transfer,
     create_express_connected_account,
+    get_min_payout_cents,
     get_platform_fee_percent,
     parse_thin_event_notification,
     retrieve_checkout_session,
@@ -254,7 +257,7 @@ def purchase_amount_cents(p: dict) -> float:
 
 
 def purchase_seller_net_cents(p: dict) -> float:
-    """Part vendeur après commission plateforme (Connect). Sinon fallback sur le prix payé (legacy)."""
+    """Part vendeur après commission plateforme. Sinon fallback sur le prix payé (legacy)."""
     v = p.get("seller_net_cents")
     if v is not None:
         try:
@@ -262,6 +265,59 @@ def purchase_seller_net_cents(p: dict) -> float:
         except (TypeError, ValueError):
             pass
     return purchase_amount_cents(p)
+
+
+def _as_int_cents(value, default: int = 0) -> int:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _connect_account_can_receive(acct) -> bool:
+    if not acct:
+        return False
+    if getattr(acct, "payouts_enabled", False) or getattr(acct, "charges_enabled", False):
+        return True
+    caps = getattr(acct, "capabilities", None)
+    if caps is None:
+        return False
+    transfers = caps.get("transfers") if isinstance(caps, dict) else getattr(caps, "transfers", None)
+    return str(transfers or "") == "active"
+
+
+async def _credit_artist_wallet_from_paid_transaction(transaction: dict) -> bool:
+    """Crédite la cagnotte artiste une seule fois (webhook + polling status)."""
+    if not transaction or transaction.get("settlement") != "wallet":
+        return False
+    txn_id = transaction.get("transaction_id")
+    artist_id = transaction.get("artist_id")
+    net = _as_int_cents(transaction.get("seller_amount_cents"), 0)
+    if not txn_id or not artist_id or net <= 0:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    claimed = await db.payment_transactions.find_one_and_update(
+        {"transaction_id": txn_id, "wallet_credited": {"$ne": True}},
+        {"$set": {"wallet_credited": True, "wallet_credited_at": now}},
+        projection={"transaction_id": 1},
+    )
+    if not claimed:
+        return False
+    await db.users.update_one(
+        {"user_id": artist_id},
+        {"$inc": {"wallet_available_cents": net}},
+    )
+    await db.wallet_ledger.insert_one(
+        {
+            "entry_id": f"wle_{uuid.uuid4().hex[:12]}",
+            "artist_id": artist_id,
+            "kind": "sale_credit",
+            "amount_cents": net,
+            "transaction_id": txn_id,
+            "created_at": now,
+        }
+    )
+    return True
 
 
 # ==================== PUBLIC ROUTES ====================
@@ -416,7 +472,9 @@ async def compute_contest_standings(
 
     leaderboard = []
     for idx, (aid, cents) in enumerate(ranked, start=1):
-        u = by_id.get(aid) or {}
+        u = by_id.get(aid) or {"user_id": aid}
+        u = await _ensure_default_picture(u)
+        by_id[aid] = u
         gdoc = genres_by_id.get(aid) or {}
         genres = gdoc.get("genres") or gdoc.get("genre") or []
         if isinstance(genres, str):
@@ -1106,6 +1164,48 @@ def validate_oauth_state(request: Request, state: Optional[str]):
         if not state or state != expected_state:
             raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
+DEFAULT_MASK_AVATARS = [
+    "/avatars/mask-01.jpg",
+    "/avatars/mask-02.jpg",
+    "/avatars/mask-03.jpg",
+    "/avatars/mask-04.jpg",
+    "/avatars/mask-05.jpg",
+    "/avatars/mask-06.jpg",
+    "/avatars/mask-07.jpg",
+    "/avatars/mask-08.jpg",
+]
+
+
+def _fnv1a_32(text: str) -> int:
+    h = 2166136261
+    for ch in str(text or ""):
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def _is_mask_avatar(url: Optional[str]) -> bool:
+    return "/avatars/mask-" in str(url or "")
+
+
+def _default_mask_avatar(user_id: Optional[str]) -> str:
+    key = str(user_id or "artist")
+    return DEFAULT_MASK_AVATARS[_fnv1a_32(key) % len(DEFAULT_MASK_AVATARS)]
+
+
+async def _ensure_default_picture(user: Optional[dict]) -> Optional[dict]:
+    """Assign a stable default mask once; never overwrite a custom photo."""
+    if not user or not user.get("user_id"):
+        return user
+    picture = str(user.get("picture") or "").strip()
+    if picture:
+        return user
+    url = _default_mask_avatar(user["user_id"])
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"picture": url}})
+    user["picture"] = url
+    return user
+
+
 async def get_current_user(authorization: Optional[str] = Header(None), request: Request = None) -> dict:
     """Get current user from JWT token in Authorization header or session_token cookie"""
     token = None
@@ -1183,11 +1283,11 @@ async def ensure_admin_flag(user: dict) -> dict:
         if user.get("is_admin"):
             await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": False}})
             user["is_admin"] = False
-        return user
+        return await _ensure_default_picture(user)
     if email_is_listed_admin(email) and not user.get("is_admin"):
         await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
         user["is_admin"] = True
-    return user
+    return await _ensure_default_picture(user)
 
 def user_response_from_doc(user: dict) -> UserResponse:
     return UserResponse(
@@ -1221,7 +1321,7 @@ async def register(user_data: UserRegister):
         "email": email,
         "password_hash": hashed_pwd,
         "name": user_data.name,
-        "picture": None,
+        "picture": _default_mask_avatar(user_id),
         "role": "artist" if user_data.artist_name else "user",
         "artist_name": user_data.artist_name,
         "is_admin": email_is_listed_admin(email),
@@ -1463,7 +1563,7 @@ async def upsert_google_user(user_info: dict) -> dict:
             "email": email,
             "password_hash": None,
             "name": user_info.get("name") or user_info.get("given_name") or "",
-            "picture": user_info.get("picture"),
+            "picture": str(user_info.get("picture") or "").strip() or _default_mask_avatar(user_id),
             "role": "user",
             "artist_name": None,
             "is_admin": email_is_listed_admin(email),
@@ -1474,8 +1574,10 @@ async def upsert_google_user(user_info: dict) -> dict:
         user_id = user_doc["user_id"]
         update_fields = {
             "name": user_info.get("name") or user_info.get("given_name") or user_doc.get("name"),
-            "picture": user_info.get("picture"),
         }
+        existing_picture = str(user_doc.get("picture") or "").strip()
+        if not existing_picture:
+            update_fields["picture"] = str(user_info.get("picture") or "").strip() or _default_mask_avatar(user_id)
         # Never promote a Gmail-alias account just because Google returned the primary address.
         if email_is_listed_admin(user_doc.get("email") or ""):
             update_fields["is_admin"] = True
@@ -1610,6 +1712,7 @@ async def update_me(payload: UserMeUpdate, authorization: Optional[str] = Header
     if updates:
         await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
         user.update(updates)
+    user = await _ensure_default_picture(user)
     return user_response_from_doc(user)
 
 @api_router.post("/auth/logout")
@@ -3661,12 +3764,17 @@ async def update_album_track(album_id: str, track_id: str, payload: dict, author
 # ==================== ARTIST ROUTES ====================
 
 def _custom_avatar_url(*candidates) -> Optional[str]:
-    """URL choisi par l’artiste. Les masques par défaut restent côté front."""
+    """Photo perso en priorité, sinon le masque déjà stocké."""
+    fallback = None
     for raw in candidates:
         value = str(raw or "").strip()
-        if value and "/avatars/mask-" not in value:
+        if not value:
+            continue
+        if not _is_mask_avatar(value):
             return value
-    return None
+        if fallback is None:
+            fallback = value
+    return fallback
 
 
 async def _apply_custom_avatars(artists: list) -> None:
@@ -3680,9 +3788,12 @@ async def _apply_custom_avatars(artists: list) -> None:
     by_id = {p["user_id"]: p for p in profiles}
     for artist in artists:
         profile = by_id.get(artist.get("user_id")) or {}
-        custom = _custom_avatar_url(profile.get("avatar_url"), artist.get("picture"))
-        artist["avatar_url"] = profile.get("avatar_url") or None
-        artist["picture"] = custom
+        artist["avatar_url"] = str(profile.get("avatar_url") or "").strip() or None
+        chosen = _custom_avatar_url(profile.get("avatar_url"), artist.get("picture"))
+        if not chosen:
+            await _ensure_default_picture(artist)
+            chosen = artist.get("picture")
+        artist["picture"] = chosen
 
 @api_router.get("/artists")
 async def get_artists(limit: int = 50):
@@ -4312,33 +4423,8 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
         "Album" if checkout_data.item_type == "album" else "Track"
     )
 
-    connect_account_id = seller.get("stripe_connect_account_id")
     fee_cents = compute_platform_fee_cents(amount_total_cents)
-    use_connect = (
-        stripe_connect_enabled()
-        and amount_total_cents > 0
-        and bool(connect_account_id)
-    )
-
-    if stripe_connect_enabled() and amount_total_cents > 0:
-        if not connect_account_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Ce vendeur n'a pas encore activé les paiements (Stripe Connect). Réessaie plus tard.",
-            )
-        try:
-            acct = await asyncio.to_thread(retrieve_connect_account, connect_account_id)
-            if not getattr(acct, "charges_enabled", False):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Le vendeur n'a pas terminé l'activation des paiements Stripe.",
-                )
-        except HTTPException:
-            raise
-        except stripe.error.StripeError as e:
-            logger.warning("Stripe Connect account: %s", e, exc_info=True)
-            msg = getattr(e, "user_message", None) or getattr(e, "message", None) or str(e)
-            raise HTTPException(status_code=502, detail=f"Stripe Connect: {msg}")
+    seller_amount_cents = max(0, int(amount_total_cents) - int(fee_cents))
 
     try:
         session_result = await create_checkout_session(
@@ -4349,16 +4435,12 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
             item_id=item_id,
             origin_url=checkout_data.origin_url,
             artist_id=artist_id,
-            connect_account_id=connect_account_id if use_connect else None,
-            platform_fee_cents=fee_cents if use_connect else None,
         )
     except stripe.error.StripeError as e:
         # Clé invalide, réseau, paramètres Stripe, etc. — éviter une 500 sans message.
         logger.warning("Stripe checkout session: %s", e, exc_info=True)
         msg = getattr(e, "user_message", None) or getattr(e, "message", None) or str(e)
         raise HTTPException(status_code=502, detail=f"Stripe: {msg}")
-
-    seller_amount = float(amount_total_cents - fee_cents) if use_connect else float(amount_total_cents)
 
     transaction_doc = {
         "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
@@ -4368,14 +4450,16 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
         "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
         "status": "pending",
         "payment_status": "pending",
+        "settlement": "wallet",
+        "wallet_credited": False,
         "metadata": {
             "item_type": checkout_data.item_type,
             "item_id": item_id,
         },
         "artist_id": artist_id,
-        "stripe_connect_account_id": connect_account_id if use_connect else None,
-        "platform_fee_cents": int(fee_cents) if use_connect else 0,
-        "seller_amount_cents": int(round(seller_amount)) if use_connect else int(amount_total_cents),
+        "stripe_connect_account_id": None,
+        "platform_fee_cents": int(fee_cents),
+        "seller_amount_cents": int(seller_amount_cents),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -4392,9 +4476,10 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
             "artist_id": artist_id,
             "amount_cents": int(amount_total_cents),
             "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
-            "connect_used": bool(use_connect),
-            "platform_fee_cents": int(fee_cents) if use_connect else 0,
-            "seller_net_cents": int(round(seller_amount)) if use_connect else int(amount_total_cents),
+            "connect_used": False,
+            "settlement": "wallet",
+            "platform_fee_cents": int(fee_cents),
+            "seller_net_cents": int(seller_amount_cents),
         },
     )
 
@@ -4530,6 +4615,8 @@ async def get_checkout_status(session_id: str, authorization: Optional[str] = He
                 item_id=item_id,
                 amount_cents=price_paid,
             ))
+
+        await _credit_artist_wallet_from_paid_transaction(transaction)
 
         await log_transaction_event(
             kind="checkout_paid",
@@ -4808,6 +4895,9 @@ async def fulfill_checkout_session_completed(sess) -> None:
                     amount_cents=price_paid or 0,
                 ))
 
+        if transaction:
+            await _credit_artist_wallet_from_paid_transaction(transaction)
+
         await log_transaction_event(
             kind="checkout_completed",
             data={
@@ -5017,15 +5107,204 @@ async def artist_stripe_connect_balance(authorization: Optional[str] = Header(No
     cur = STRIPE_CURRENCY_ENV
     available = _balance_amount_for_currency(bal, "available", cur)
     pending = _balance_amount_for_currency(bal, "pending", cur)
-    try:
-        hint = float(os.environ.get("STRIPE_MIN_PAYOUT_HINT_EUROS", "20"))
-    except (TypeError, ValueError):
-        hint = 20.0
+    min_cents = get_min_payout_cents()
     return {
         "currency": cur,
         "available_cents": available,
         "pending_cents": pending,
-        "min_payout_hint_euros": hint,
+        "min_payout_hint_euros": round(min_cents / 100.0, 2),
+    }
+
+
+@api_router.get("/artist/wallet")
+async def artist_wallet(authorization: Optional[str] = Header(None), request: Request = None):
+    """Cagnotte Kloud : ventes encaissées sur la plateforme, à retirer via Stripe Connect."""
+    user = await get_current_user(authorization, request)
+    if user.get("role") != "artist":
+        raise HTTPException(status_code=403, detail="Réservé aux artistes")
+
+    available = _as_int_cents(user.get("wallet_available_cents"), 0)
+    paid_out = _as_int_cents(user.get("wallet_paid_out_cents"), 0)
+    min_cents = get_min_payout_cents()
+    acct_id = user.get("stripe_connect_account_id")
+    has_account = bool(acct_id)
+    charges_enabled = False
+    payouts_enabled = False
+    details_submitted = False
+    connect_ready = False
+
+    if has_account and stripe_configured():
+        try:
+            acct = await asyncio.to_thread(retrieve_connect_account, acct_id)
+            charges_enabled = bool(getattr(acct, "charges_enabled", False))
+            payouts_enabled = bool(getattr(acct, "payouts_enabled", False))
+            details_submitted = bool(getattr(acct, "details_submitted", False))
+            connect_ready = _connect_account_can_receive(acct)
+        except stripe.error.StripeError as e:
+            logger.warning("wallet connect status: %s", e)
+
+    blocked = None
+    can_withdraw = False
+    if available < min_cents:
+        blocked = "below_minimum"
+    elif not has_account or not connect_ready:
+        blocked = "connect_required"
+    else:
+        can_withdraw = True
+
+    return {
+        "currency": STRIPE_CURRENCY_ENV,
+        "available_cents": available,
+        "paid_out_cents": paid_out,
+        "min_payout_cents": min_cents,
+        "min_payout_euros": round(min_cents / 100.0, 2),
+        "platform_fee_percent": get_platform_fee_percent(),
+        "can_withdraw": can_withdraw,
+        "withdraw_blocked_reason": blocked,
+        "has_account": has_account,
+        "charges_enabled": charges_enabled,
+        "payouts_enabled": payouts_enabled,
+        "details_submitted": details_submitted,
+        "connect_ready": connect_ready,
+        "connect_enabled": stripe_connect_enabled(),
+    }
+
+
+@api_router.post("/artist/wallet/payout")
+async def artist_wallet_payout(authorization: Optional[str] = Header(None), request: Request = None):
+    """Retire toute la cagnotte vers Stripe Connect (seuil minimum)."""
+    user = await get_current_user(authorization, request)
+    if user.get("role") != "artist":
+        raise HTTPException(status_code=403, detail="Réservé aux artistes")
+    ensure_stripe_available()
+    if not stripe_connect_enabled():
+        raise HTTPException(status_code=400, detail="Stripe Connect est désactivé")
+
+    min_cents = get_min_payout_cents()
+    available = _as_int_cents(user.get("wallet_available_cents"), 0)
+    if available < min_cents:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Retrait possible à partir de {min_cents / 100:.0f} € (cagnotte actuelle : {available / 100:.2f} €).",
+        )
+
+    acct_id = user.get("stripe_connect_account_id")
+    if not acct_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Active Stripe Connect pour retirer ta cagnotte.",
+        )
+    try:
+        acct = await asyncio.to_thread(retrieve_connect_account, acct_id)
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if not _connect_account_can_receive(acct):
+        raise HTTPException(
+            status_code=400,
+            detail="Termine l'activation Stripe Connect pour retirer ta cagnotte.",
+        )
+
+    amount = available
+    payout_id = f"payout_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    claimed = await db.users.find_one_and_update(
+        {"user_id": user["user_id"], "wallet_available_cents": amount},
+        {
+            "$inc": {
+                "wallet_available_cents": -amount,
+                "wallet_paid_out_cents": amount,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        raise HTTPException(status_code=409, detail="Cagnotte mise à jour pendant le retrait — réessaie.")
+
+    await db.artist_payouts.insert_one(
+        {
+            "payout_id": payout_id,
+            "artist_id": user["user_id"],
+            "amount_cents": amount,
+            "currency": STRIPE_CURRENCY_ENV,
+            "status": "pending",
+            "created_at": now,
+        }
+    )
+
+    try:
+        transfer = await asyncio.to_thread(
+            create_connect_transfer,
+            amount_cents=amount,
+            currency=STRIPE_CURRENCY_ENV,
+            destination=acct_id,
+            transfer_id=payout_id,
+            metadata={
+                "artist_id": str(user["user_id"]),
+                "payout_id": payout_id,
+            },
+        )
+    except stripe.error.StripeError as e:
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {
+                "$inc": {
+                    "wallet_available_cents": amount,
+                    "wallet_paid_out_cents": -amount,
+                }
+            },
+        )
+        await db.artist_payouts.update_one(
+            {"payout_id": payout_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "error": str(e),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        msg = getattr(e, "user_message", None) or getattr(e, "message", None) or str(e)
+        raise HTTPException(status_code=502, detail=f"Retrait Stripe impossible : {msg}")
+
+    transfer_id = getattr(transfer, "id", None)
+    await db.artist_payouts.update_one(
+        {"payout_id": payout_id},
+        {
+            "$set": {
+                "status": "transferred",
+                "stripe_transfer_id": transfer_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+    await db.wallet_ledger.insert_one(
+        {
+            "entry_id": f"wle_{uuid.uuid4().hex[:12]}",
+            "artist_id": user["user_id"],
+            "kind": "payout_debit",
+            "amount_cents": -amount,
+            "payout_id": payout_id,
+            "stripe_transfer_id": transfer_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    await log_transaction_event(
+        kind="artist_wallet_payout",
+        data={
+            "payout_id": payout_id,
+            "artist_id": user["user_id"],
+            "amount_cents": amount,
+            "currency": STRIPE_CURRENCY_ENV,
+            "stripe_transfer_id": transfer_id,
+        },
+    )
+    return {
+        "payout_id": payout_id,
+        "amount_cents": amount,
+        "currency": STRIPE_CURRENCY_ENV,
+        "stripe_transfer_id": transfer_id,
+        "available_cents": _as_int_cents(claimed.get("wallet_available_cents"), 0),
+        "paid_out_cents": _as_int_cents(claimed.get("wallet_paid_out_cents"), 0),
     }
 
 

@@ -54,7 +54,7 @@ def get_platform_fee_percent() -> float:
 
 
 def compute_platform_fee_cents(amount_cents: int, fee_percent: Optional[float] = None) -> int:
-    """Commission plateforme en centimes (Connect). Laisse au moins 1 centime au vendeur si montant > 1."""
+    """Commission plateforme en centimes. Laisse au moins 1 centime au vendeur si montant > 1."""
     if amount_cents <= 0:
         return 0
     pct = get_platform_fee_percent() if fee_percent is None else fee_percent
@@ -63,6 +63,20 @@ def compute_platform_fee_cents(amount_cents: int, fee_percent: Optional[float] =
     if amount_cents == 1:
         return 0
     return raw
+
+
+def get_min_payout_cents() -> int:
+    """Seuil de retrait cagnotte → Stripe Connect (défaut 10 €)."""
+    raw = (
+        os.environ.get("STRIPE_MIN_PAYOUT_EUROS")
+        or os.environ.get("STRIPE_MIN_PAYOUT_HINT_EUROS")
+        or "10"
+    ).strip()
+    try:
+        euros = float(raw)
+    except (TypeError, ValueError):
+        euros = 10.0
+    return max(100, int(round(max(0.0, euros) * 100)))
 
 
 async def create_checkout_session(
@@ -77,7 +91,7 @@ async def create_checkout_session(
     connect_account_id: Optional[str] = None,
     platform_fee_cents: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Crée une session Stripe Checkout (hosted). Connect : destination + application_fee."""
+    """Crée une session Stripe Checkout (hosted). L'argent reste sur le compte plateforme (cagnotte)."""
     configure_stripe()
     origin = _frontend_origin_from_env_or_request(origin_url)
     if not origin:
@@ -112,14 +126,8 @@ async def create_checkout_session(
             "cancel_url": cancel_url,
             "metadata": meta,
         }
-        if connect_account_id and platform_fee_cents is not None and stripe_connect_enabled():
-            fee = max(0, min(int(platform_fee_cents), max(1, int(amount_cents)) - 1))
-            if int(amount_cents) <= 1:
-                fee = 0
-            params["payment_intent_data"] = {
-                "application_fee_amount": fee,
-                "transfer_data": {"destination": connect_account_id},
-            }
+        # Les ventes restent sur le compte Kloud. Le versement artiste se fait plus tard
+        # (cagnotte → Transfer Connect), même si un compte Express existe déjà.
         return stripe.checkout.Session.create(**params)
 
     session = await asyncio.to_thread(_create)
@@ -231,3 +239,22 @@ def retrieve_connect_account(account_id: str) -> Any:
 def retrieve_connect_balance(account_id: str) -> Any:
     configure_stripe()
     return stripe.Balance.retrieve(stripe_account=account_id)
+
+
+def create_connect_transfer(
+    *,
+    amount_cents: int,
+    currency: str,
+    destination: str,
+    transfer_id: str,
+    metadata: Optional[Dict[str, str]] = None,
+) -> Any:
+    """Virement interne plateforme → compte Connect Express."""
+    configure_stripe()
+    return stripe.Transfer.create(
+        amount=max(1, int(amount_cents)),
+        currency=(currency or STRIPE_CURRENCY).lower(),
+        destination=destination,
+        metadata=metadata or {},
+        idempotency_key=f"kloud_payout_{transfer_id}",
+    )

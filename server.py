@@ -1122,7 +1122,7 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
             token = authorization
     
     if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise HTTPException(status_code=401, detail="Connecte-toi pour continuer")
     
     # Check if it's a JWT token (custom auth)
     try:
@@ -1130,35 +1130,35 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
         token_type = payload.get("type")
         # Accepte les access tokens + les JWT legacy (sans champ type)
         if token_type and token_type != "access":
-            raise HTTPException(status_code=401, detail="Invalid token type")
+            raise HTTPException(status_code=401, detail="Session invalide")
         user_id = payload.get("user_id")
         if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(status_code=401, detail="Session invalide")
         
         user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
         if not user_doc:
-            raise HTTPException(status_code=401, detail="User not found")
+            raise HTTPException(status_code=401, detail="Compte introuvable")
         return await ensure_admin_flag(user_doc)
     except HTTPException:
         raise
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
+        raise HTTPException(status_code=401, detail="Session expirée, reconnecte-toi")
     except jwt.InvalidTokenError:
         pass
     
     # Check if it's a Google OAuth session token
     session_doc = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
     if not session_doc:
-        raise HTTPException(status_code=401, detail="Invalid session")
+        raise HTTPException(status_code=401, detail="Session invalide")
     
     # Check expiry
     expires_at = _parse_iso_dt(session_doc["expires_at"])
     if expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=401, detail="Session expired")
+        raise HTTPException(status_code=401, detail="Session expirée, reconnecte-toi")
     
     user_doc = await db.users.find_one({"user_id": session_doc["user_id"]}, {"_id": 0})
     if not user_doc:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="Compte introuvable")
 
     return await ensure_admin_flag(user_doc)
 
@@ -2845,9 +2845,13 @@ async def _ensure_album_can_publish(album: Optional[dict]) -> None:
 
 
 def _playable_preview_url(track: Optional[dict]) -> str:
-    """Dedicated preview clip, or the full file (player keeps a 15s window)."""
+    """Play the uploaded file when possible (player keeps a 15s window).
+
+    Prefer `file_url` over a generated clip: a stale/wrong preview clip was
+    making catalog playback launch a different song than the clicked track.
+    """
     data = track or {}
-    return str(data.get("preview_url") or data.get("file_url") or "").strip()
+    return str(data.get("file_url") or data.get("preview_url") or "").strip()
 
 
 def _track_response(track: dict, *, include_file: bool = False) -> TrackResponse:
@@ -3073,8 +3077,20 @@ async def _audio_access_level(file_id: str, request: Request, authorization: Opt
     meta = getattr(grid_out, "metadata", None) or {}
     kind = str(meta.get("kind") or "")
     file_url = f"/api/files/audio/{file_id}"
-    as_full = await db.tracks.find_one({"file_url": file_url}, {"_id": 0})
-    as_preview = await db.tracks.find_one({"preview_url": file_url}, {"_id": 0})
+    matches = await db.tracks.find(
+        {"$or": [{"file_url": file_url}, {"preview_url": file_url}]},
+        {"_id": 0},
+    ).to_list(50)
+
+    def _pick(field: str) -> Optional[dict]:
+        matched = [t for t in matches if str(t.get(field) or "") == file_url]
+        if not matched:
+            return None
+        published = [t for t in matched if _is_catalog_published(t)]
+        return (published or matched)[0]
+
+    as_full = _pick("file_url")
+    as_preview = _pick("preview_url")
     if kind == "audio_preview" and not as_full:
         return "preview"
     user = await _user_from_audio_request(request, authorization)
@@ -3730,9 +3746,9 @@ async def get_playlist(playlist_id: str, authorization: Optional[str] = Header(N
 
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
 
     return PlaylistResponse(**playlist)
 
@@ -3742,9 +3758,9 @@ async def update_playlist(playlist_id: str, payload: PlaylistUpdate, authorizati
 
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
 
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not update_data:
@@ -3762,10 +3778,10 @@ async def update_playlist_tracks(playlist_id: str, track_ids: List[str], authori
     
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
     
     await db.playlists.update_one(
         {"playlist_id": playlist_id},
@@ -3786,9 +3802,9 @@ async def add_track_to_playlist(playlist_id: str, payload: PlaylistTrackAdd, aut
 
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
 
     track_id = payload.track_id
     exists = await db.tracks.find_one({"track_id": track_id}, {"_id": 1})
@@ -3810,9 +3826,9 @@ async def remove_track_from_playlist(playlist_id: str, track_id: str, authorizat
 
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
 
     await db.playlists.update_one(
         {"playlist_id": playlist_id},
@@ -3826,10 +3842,10 @@ async def delete_playlist(playlist_id: str, authorization: Optional[str] = Heade
     
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
     
     await db.playlists.delete_one({"playlist_id": playlist_id})
     return {"message": "Playlist deleted"}
@@ -4172,7 +4188,9 @@ async def get_likes(authorization: Optional[str] = Header(None), request: Reques
 @api_router.get("/likes/state")
 async def get_likes_state(item_type: str, ids: str, authorization: Optional[str] = Header(None), request: Request = None):
     """Return a map {id: boolean} for the given item_type and comma-separated ids."""
-    user = await get_current_user(authorization, request)
+    user = await _optional_user(authorization, request)
+    if not user:
+        return {}
 
     id_list = [i.strip() for i in (ids or "").split(",") if i.strip()]
     if not id_list:
@@ -4681,7 +4699,9 @@ async def get_my_follows(limit: int = 200, authorization: Optional[str] = Header
 
 @api_router.get("/follows/state")
 async def get_follow_state(artist_ids: str, authorization: Optional[str] = Header(None), request: Request = None):
-    user = await get_current_user(authorization, request)
+    user = await _optional_user(authorization, request)
+    if not user:
+        return {}
     ids_list = [i.strip() for i in (artist_ids or "").split(",") if i.strip()]
     if not ids_list:
         return {}

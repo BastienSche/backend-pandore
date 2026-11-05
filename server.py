@@ -2846,27 +2846,25 @@ async def _ensure_album_can_publish(album: Optional[dict]) -> None:
         )
 
 
+def _playable_preview_url(track: Optional[dict]) -> str:
+    """Dedicated preview clip, or the full file (player keeps a 15s window)."""
+    data = track or {}
+    return str(data.get("preview_url") or data.get("file_url") or "").strip()
+
+
 def _track_response(track: dict, *, include_file: bool = False) -> TrackResponse:
     data = dict(track or {})
-    file_url = data.get("file_url") or ""
-    preview_url = data.get("preview_url") or ""
-    if not include_file:
-        data["file_url"] = None
-        if preview_url and file_url and preview_url == file_url:
-            data["preview_url"] = ""
-    else:
-        data["file_url"] = file_url or None
-    data["preview_url"] = data.get("preview_url") or ""
+    file_url = str(data.get("file_url") or "").strip()
+    preview_url = _playable_preview_url(data)
+    data["preview_url"] = preview_url
+    data["file_url"] = file_url if include_file else None
     return TrackResponse(**data)
 
 
 def _public_track_doc(track: dict) -> dict:
     data = dict(track or {})
-    file_url = data.get("file_url") or ""
-    preview_url = data.get("preview_url") or ""
+    data["preview_url"] = _playable_preview_url(data)
     data.pop("file_url", None)
-    if preview_url and file_url and preview_url == file_url:
-        data["preview_url"] = ""
     return data
 
 
@@ -2960,6 +2958,40 @@ def _is_catalog_published(doc: Optional[dict]) -> bool:
     return str((doc or {}).get("status") or "published").lower() in {"published", "public"}
 
 
+async def _catalog_visible_track_ids(tracks: List[dict]) -> set:
+    """Published tracks, plus draft members of a published album (legacy data)."""
+    visible = {t["track_id"] for t in tracks if t.get("track_id") and _is_catalog_published(t)}
+    pending = [t for t in tracks if t.get("track_id") and t["track_id"] not in visible]
+    if not pending:
+        return visible
+    tids = [t["track_id"] for t in pending]
+    aids = [t.get("album_id") for t in pending if t.get("album_id")]
+    clauses = []
+    if tids:
+        clauses.append({"track_ids": {"$in": tids}})
+    if aids:
+        clauses.append({"album_id": {"$in": aids}})
+    albums = await db.albums.find(
+        {"$or": clauses},
+        {"_id": 0, "album_id": 1, "track_ids": 1, "status": 1},
+    ).to_list(1000)
+    pub_album_ids = set()
+    pub_member_ids = set()
+    for album in albums:
+        if not _is_catalog_published(album):
+            continue
+        if album.get("album_id"):
+            pub_album_ids.add(album["album_id"])
+        for tid in album.get("track_ids") or []:
+            if tid:
+                pub_member_ids.add(tid)
+    for track in pending:
+        tid = track["track_id"]
+        if tid in pub_member_ids or track.get("album_id") in pub_album_ids:
+            visible.add(tid)
+    return visible
+
+
 def _catalog_status_query(status: Optional[str], user: Optional[dict]) -> Optional[dict]:
     """Mongo fragment for public lists. None = no access (empty result)."""
     wanted = (status or "").strip().lower()
@@ -2974,6 +3006,24 @@ def _catalog_status_query(status: Optional[str], user: Optional[dict]) -> Option
     if user and user_is_admin(user):
         return {"status": status}
     return None
+
+
+async def _published_album_id_set() -> set:
+    albums = await db.albums.find(
+        {"status": {"$nin": ["draft"]}},
+        {"_id": 0, "album_id": 1},
+    ).to_list(5000)
+    return {a["album_id"] for a in albums if a.get("album_id")}
+
+
+async def _catalog_track_list_query(extra: Optional[dict] = None) -> dict:
+    """Published tracks, plus draft members of a published album."""
+    pub_albums = await _published_album_id_set()
+    status_ok = {"status": {"$nin": ["draft"]}}
+    visible = {"$or": [status_ok, {"album_id": {"$in": list(pub_albums)}}]} if pub_albums else status_ok
+    if extra:
+        return {"$and": [visible, extra]}
+    return visible
 
 
 async def _user_owns_album(user: Optional[dict], album: Optional[dict]) -> bool:
@@ -3034,7 +3084,16 @@ async def _audio_access_level(file_id: str, request: Request, authorization: Opt
         return "full"
     if as_full and await _user_owns_track(user, as_full):
         return "full"
-    if not as_full and as_preview and kind == "audio_preview":
+    if as_full and (
+        _is_catalog_published(as_full)
+        or as_full.get("track_id") in await _catalog_visible_track_ids([as_full])
+    ):
+        return "preview"
+    if as_preview and (
+        kind == "audio_preview"
+        or _is_catalog_published(as_preview)
+        or as_preview.get("track_id") in await _catalog_visible_track_ids([as_preview])
+    ):
         return "preview"
     return None
 
@@ -3311,11 +3370,11 @@ async def get_tracks(
         user = await _optional_user(authorization, request)
         found = await db.tracks.find({"track_id": {"$in": id_list}}, {"_id": 0}).to_list(len(id_list))
         owned_ids = await _batch_owned_track_ids(user, found)
+        listed_ids = await _catalog_visible_track_ids(found)
         visible = []
         for track in found:
             tid = track.get("track_id")
-            is_pub = str(track.get("status") or "").lower() in {"published", "public"}
-            if is_pub or tid in owned_ids:
+            if tid in listed_ids or tid in owned_ids:
                 visible.append(track)
         by_id = {t["track_id"]: t for t in visible if t.get("track_id")}
         ordered = [by_id[tid] for tid in id_list if tid in by_id]
@@ -3329,9 +3388,14 @@ async def get_tracks(
     if status_q is None:
         return []
 
-    query = dict(status_q)
-    if genre:
-        query["genre"] = genre
+    wanted = (status or "").strip().lower()
+    extra = {"genre": genre} if genre else None
+    if not wanted or wanted in {"published", "public"}:
+        query = await _catalog_track_list_query(extra)
+    else:
+        query = dict(status_q)
+        if extra:
+            query.update(extra)
 
     tracks = await db.tracks.find(query, {"_id": 0}).skip(skip).limit(limit).to_list(limit)
     return [_track_response(track, include_file=False) for track in tracks]
@@ -3343,7 +3407,8 @@ async def get_track(track_id: str, authorization: Optional[str] = Header(None), 
         raise HTTPException(status_code=404, detail="Track not found")
     user = await _optional_user(authorization, request)
     owned = await _user_owns_track(user, track)
-    if not _is_catalog_published(track) and not owned:
+    listed = track.get("track_id") in await _catalog_visible_track_ids([track])
+    if not listed and not owned:
         raise HTTPException(status_code=404, detail="Track not found")
     return _track_response(track, include_file=owned)
 
@@ -3619,12 +3684,16 @@ async def get_artist(artist_id: str):
 
     await _apply_custom_avatars([artist])
     
-    # Get artist's tracks
-    tracks = await db.tracks.find({"artist_id": artist_id, "status": "published"}, {"_id": 0}).to_list(100)
-    artist["tracks"] = [_public_track_doc(track) for track in tracks]
-    
-    # Get artist's albums
-    albums = await db.albums.find({"artist_id": artist_id, "status": "published"}, {"_id": 0}).to_list(100)
+    tracks = await db.tracks.find({"artist_id": artist_id}, {"_id": 0}).to_list(200)
+    visible_ids = await _catalog_visible_track_ids(tracks)
+    artist["tracks"] = [
+        _public_track_doc(track) for track in tracks if track.get("track_id") in visible_ids
+    ]
+
+    albums = await db.albums.find(
+        {"artist_id": artist_id, "status": {"$nin": ["draft"]}},
+        {"_id": 0},
+    ).to_list(100)
     artist["albums"] = await _hydrate_album_track_ids(albums)
     
     return artist
@@ -5221,10 +5290,10 @@ async def search(q: str, types: str = "tracks,albums,artists", limit: int = 20):
     published = {"status": {"$nin": ["draft"]}}
 
     if "tracks" in type_set:
-        tracks = await db.tracks.find(
-            {**published, "$or": [{"title": regex}, {"artist_name": regex}, {"genre": regex}]},
-            {"_id": 0},
-        ).limit(limit).to_list(limit)
+        track_query = await _catalog_track_list_query(
+            {"$or": [{"title": regex}, {"artist_name": regex}, {"genre": regex}]}
+        )
+        tracks = await db.tracks.find(track_query, {"_id": 0}).limit(limit).to_list(limit)
         results["tracks"] = [_public_track_doc(track) for track in tracks]
 
     if "albums" in type_set:

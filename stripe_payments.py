@@ -1,7 +1,7 @@
 """
 Paiements Stripe (Checkout Session) + Stripe Connect (Express).
 Variables : STRIPE_API_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_WEBHOOK_SECRET_THIN (optionnel),
-STRIPE_CURRENCY, STRIPE_PLATFORM_FEE_PERCENT (défaut 15), STRIPE_CONNECT_ENABLED (défaut true).
+STRIPE_CURRENCY, STRIPE_PLATFORM_FEE_PERCENT (défaut 5), STRIPE_CONNECT_ENABLED (défaut true).
 """
 from __future__ import annotations
 
@@ -45,11 +45,11 @@ def stripe_connect_enabled() -> bool:
 
 
 def get_platform_fee_percent() -> float:
-    raw = os.environ.get("STRIPE_PLATFORM_FEE_PERCENT", "15").strip()
+    raw = os.environ.get("STRIPE_PLATFORM_FEE_PERCENT", "5").strip()
     try:
         p = float(raw)
     except (TypeError, ValueError):
-        p = 15.0
+        p = 5.0
     return max(0.0, min(p, 99.0))
 
 

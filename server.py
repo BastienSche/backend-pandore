@@ -1752,13 +1752,15 @@ async def logout(
 
 @api_router.put("/auth/role")
 async def update_role(new_role: str, artist_name: Optional[str] = None, authorization: Optional[str] = Header(None), request: Request = None):
-    """Toggle between user and artist role"""
+    """Passer d’auditeur à artiste (irréversible). Le rôle se choisit aussi à l’inscription."""
     user = await get_current_user(authorization, request)
     
     # Prevent privilege escalation through this endpoint.
     allowed = {"user", "artist"}
     if new_role not in allowed:
         raise HTTPException(status_code=400, detail="Invalid role")
+    if new_role == "user" and user.get("role") == "artist":
+        raise HTTPException(status_code=400, detail="Le rôle artiste ne peut pas être retiré")
     
     kept_name = str(artist_name or user.get("artist_name") or "").strip() or None
     if new_role == "artist" and not kept_name:
@@ -3009,6 +3011,14 @@ def _track_response(track: dict, *, include_file: bool = False) -> TrackResponse
     preview_url = _playable_preview_url(data)
     data["preview_url"] = preview_url
     data["file_url"] = file_url if include_file else None
+    data.setdefault("duration", None)
+    data.setdefault("description", None)
+    data.setdefault("mastering", None)
+    data.setdefault("splits", None)
+    data.setdefault("preview_start_time", 0)
+    data.setdefault("preview_duration", 15)
+    data.setdefault("likes_count", 0)
+    data.setdefault("play_count", 0)
     return TrackResponse(**data)
 
 
@@ -3560,7 +3570,7 @@ async def get_tracks(
         if extra:
             query.update(extra)
 
-    tracks = await db.tracks.find(query, {"_id": 0}).skip(skip).limit(limit).to_list(limit)
+    tracks = await db.tracks.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     return [_track_response(track, include_file=False) for track in tracks]
 
 @api_router.get("/tracks/{track_id}", response_model=TrackResponse)
@@ -3659,7 +3669,7 @@ async def get_albums(
     status_q = _catalog_status_query(status, user)
     if status_q is None:
         return []
-    albums = await db.albums.find(status_q, {"_id": 0}).skip(skip).limit(limit).to_list(limit)
+    albums = await db.albums.find(status_q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     hydrated = await _hydrate_album_track_ids(albums)
     return [AlbumResponse(**album) for album in hydrated]
 
@@ -5157,14 +5167,23 @@ async def artist_stripe_connect_status(authorization: Optional[str] = Header(Non
 
 
 @api_router.post("/artist/stripe/connect/onboard")
-async def artist_stripe_connect_onboard(authorization: Optional[str] = Header(None), request: Request = None):
+async def artist_stripe_connect_onboard(
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+    return_to: Optional[str] = Query(None),
+):
     user = await get_current_user(authorization, request)
     if user.get("role") != "artist":
         raise HTTPException(status_code=403, detail="Réservé aux artistes")
     ensure_stripe_available()
     base = os.environ.get("PUBLIC_FRONTEND_URL", "https://localhost:3000").rstrip("/")
-    refresh_url = f"{base}/artist-dashboard?connect=refresh"
-    return_url = f"{base}/artist-dashboard?connect=return"
+    dest = (return_to or "").strip().lower()
+    if dest == "settings":
+        refresh_url = f"{base}/settings?tab=artist&connect=refresh"
+        return_url = f"{base}/settings?tab=artist&connect=return"
+    else:
+        refresh_url = f"{base}/artist-dashboard?connect=refresh"
+        return_url = f"{base}/artist-dashboard?connect=return"
 
     acct_id = user.get("stripe_connect_account_id")
     try:

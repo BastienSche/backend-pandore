@@ -14,3 +14,4 @@ aiofiles>=24.1,<26
 aiohttp>=3.10,<4
 stripe>=11,<16
 python-multipart>=0.0.9,<0.1
+segno>=1.6,<2

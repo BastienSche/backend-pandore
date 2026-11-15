@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form, Request, Header, Response, Query
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
@@ -8,7 +8,7 @@ import logging
 import json
 import re
 from pathlib import Path
-from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from pydantic import AliasChoices, BaseModel, Field, EmailStr, ConfigDict
 from typing import Any, List, Optional, Literal
 import uuid
 import secrets
@@ -22,16 +22,32 @@ import bcrypt
 import jwt
 import shutil
 import asyncio
+import io
+import wave
+import tempfile
+import subprocess
 from urllib.parse import quote, urlencode
 from bson import ObjectId
 
 import stripe
+from pymongo import ReturnDocument
+from artist_analytics import AnalyticsHeartbeat, collect_site_analytics, ensure_analytics_indexes, record_heartbeat
+from share_preview import (
+    absolute_url,
+    allowed_share_target,
+    normalize_smart_links,
+    og_html,
+    public_origin,
+    qr_svg_response,
+)
 from stripe_payments import (
     compute_platform_fee_cents,
     create_account_login_link,
     create_account_onboarding_link,
     create_checkout_session,
+    create_connect_transfer,
     create_express_connected_account,
+    get_min_payout_cents,
     get_platform_fee_percent,
     parse_thin_event_notification,
     retrieve_checkout_session,
@@ -45,6 +61,23 @@ from stripe_payments import (
 ROOT_DIR = Path(__file__).parent
 # Load `.env.{APP_ENV}` then optional `.env` (local overrides). Railway/Render inject vars directly.
 _app_env = os.getenv("APP_ENV", "development").lower().strip()
+
+
+def _runtime_app_env() -> str:
+    return str(os.getenv("APP_ENV") or _app_env or "").lower().strip()
+
+
+def _is_dev_runtime() -> bool:
+    return _runtime_app_env() in {"development", "dev", "local", "test"}
+
+
+def _allow_dev_reset_link() -> bool:
+    """Reset URL in the JSON body: local only. Unset/wrong APP_ENV in prod must not leak."""
+    flag = str(os.getenv("ALLOW_DEV_RESET_LINK") or "").lower().strip()
+    if flag in {"1", "true", "yes"}:
+        return True
+    env = str(os.getenv("APP_ENV") or "").lower().strip()
+    return env in {"development", "dev", "local", "test"}
 _primary = ROOT_DIR / f".env.{_app_env}"
 if _primary.exists():
     load_dotenv(_primary)
@@ -107,9 +140,14 @@ HARDCODED_ADMIN_EMAILS = (
 )
 
 
+def canonical_email(email: str) -> str:
+    """Lowercase + trim. Does not collapse Gmail dots / +tags."""
+    return str(email or "").strip().strip("\"'").lower()
+
+
 def normalize_email(email: str) -> str:
-    """Lowercase, strip quotes, and treat Gmail dots/+tags as the same mailbox."""
-    raw = str(email or "").strip().strip("\"'").lower()
+    """Mailbox identity for uniqueness / login only. Gmail dots and +tags collapse."""
+    raw = canonical_email(email)
     if "@" not in raw:
         return raw
     local, _, domain = raw.partition("@")
@@ -121,8 +159,20 @@ def normalize_email(email: str) -> str:
 
 
 def admin_emails() -> set[str]:
-    """Seuls ces deux mails ont accès admin — liste figée dans le code."""
-    return {normalize_email(e) for e in HARDCODED_ADMIN_EMAILS}
+    """Allowlist exacte (casse ignorée). Les variantes Gmail ne sont pas admin."""
+    return {canonical_email(e) for e in HARDCODED_ADMIN_EMAILS}
+
+
+def email_is_listed_admin(email: str) -> bool:
+    return canonical_email(email) in admin_emails()
+
+
+def is_unlisted_gmail_alias_of_admin(email: str) -> bool:
+    """Same Gmail mailbox as an allowlist address, but not the exact listed address."""
+    if email_is_listed_admin(email):
+        return False
+    mailbox = normalize_email(email)
+    return any(normalize_email(listed) == mailbox for listed in admin_emails())
 
 def _load_password_reset_config() -> dict:
     cfg = {}
@@ -216,7 +266,7 @@ def purchase_amount_cents(p: dict) -> float:
 
 
 def purchase_seller_net_cents(p: dict) -> float:
-    """Part vendeur après commission plateforme (Connect). Sinon fallback sur le prix payé (legacy)."""
+    """Part vendeur après commission plateforme. Sinon fallback sur le prix payé (legacy)."""
     v = p.get("seller_net_cents")
     if v is not None:
         try:
@@ -224,6 +274,59 @@ def purchase_seller_net_cents(p: dict) -> float:
         except (TypeError, ValueError):
             pass
     return purchase_amount_cents(p)
+
+
+def _as_int_cents(value, default: int = 0) -> int:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _connect_account_can_receive(acct) -> bool:
+    if not acct:
+        return False
+    if getattr(acct, "payouts_enabled", False) or getattr(acct, "charges_enabled", False):
+        return True
+    caps = getattr(acct, "capabilities", None)
+    if caps is None:
+        return False
+    transfers = caps.get("transfers") if isinstance(caps, dict) else getattr(caps, "transfers", None)
+    return str(transfers or "") == "active"
+
+
+async def _credit_artist_wallet_from_paid_transaction(transaction: dict) -> bool:
+    """Crédite la cagnotte artiste une seule fois (webhook + polling status)."""
+    if not transaction or transaction.get("settlement") != "wallet":
+        return False
+    txn_id = transaction.get("transaction_id")
+    artist_id = transaction.get("artist_id")
+    net = _as_int_cents(transaction.get("seller_amount_cents"), 0)
+    if not txn_id or not artist_id or net <= 0:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    claimed = await db.payment_transactions.find_one_and_update(
+        {"transaction_id": txn_id, "wallet_credited": {"$ne": True}},
+        {"$set": {"wallet_credited": True, "wallet_credited_at": now}},
+        projection={"transaction_id": 1},
+    )
+    if not claimed:
+        return False
+    await db.users.update_one(
+        {"user_id": artist_id},
+        {"$inc": {"wallet_available_cents": net}},
+    )
+    await db.wallet_ledger.insert_one(
+        {
+            "entry_id": f"wle_{uuid.uuid4().hex[:12]}",
+            "artist_id": artist_id,
+            "kind": "sale_credit",
+            "amount_cents": net,
+            "transaction_id": txn_id,
+            "created_at": now,
+        }
+    )
+    return True
 
 
 # ==================== PUBLIC ROUTES ====================
@@ -378,7 +481,9 @@ async def compute_contest_standings(
 
     leaderboard = []
     for idx, (aid, cents) in enumerate(ranked, start=1):
-        u = by_id.get(aid) or {}
+        u = by_id.get(aid) or {"user_id": aid}
+        u = await _ensure_default_picture(u)
+        by_id[aid] = u
         gdoc = genres_by_id.get(aid) or {}
         genres = gdoc.get("genres") or gdoc.get("genre") or []
         if isinstance(genres, str):
@@ -452,7 +557,7 @@ def is_free_item_price(price) -> bool:
 
 class UserRegister(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(..., min_length=6)
     name: str
     artist_name: Optional[str] = None
 
@@ -527,6 +632,7 @@ class TrackResponse(BaseModel):
     preview_url: str
     preview_start_time: int
     preview_duration: int
+    file_url: Optional[str] = None
     cover_url: Optional[str]
     genre: str
     description: Optional[str]
@@ -612,6 +718,7 @@ class AlbumTrackResponse(BaseModel):
     preview_url: str
     preview_start_time: int
     preview_duration: int
+    file_url: Optional[str] = None
     cover_url: Optional[str]
     genre: str
     description: Optional[str]
@@ -654,11 +761,18 @@ class LikeRequest(BaseModel):
 class LikesStateResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+class SmartLink(BaseModel):
+    kind: str = "website"
+    url: str
+    label: Optional[str] = ""
+
 class ArtistProfileCreate(BaseModel):
-    name: str
+    model_config = ConfigDict(populate_by_name=True)
+    name: str = Field(..., validation_alias=AliasChoices("name", "artist_name"))
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
-    links: Optional[List[str]] = None
+    links: Optional[List[Any]] = None
+    genres: Optional[List[str]] = None
 
 class ArtistProfileResponse(BaseModel):
     profile_id: str
@@ -666,7 +780,8 @@ class ArtistProfileResponse(BaseModel):
     name: str
     bio: Optional[str]
     avatar_url: Optional[str]
-    links: Optional[List[str]]
+    links: Optional[List[SmartLink]] = None
+    genres: Optional[List[str]] = None
     created_at: str
     updated_at: str
 
@@ -858,13 +973,37 @@ async def rotate_refresh_token(raw_token: str, response: Optional[Response] = No
         "user": user_response_from_doc(await ensure_admin_flag(user_doc)),
     }
 
-def build_reset_password_url(raw_token: str) -> str:
-    if FRONTEND_RESET_PASSWORD_URL:
+def _request_frontend_origin(request: Optional[Request]) -> str:
+    if request is None:
+        return ""
+    raw = str(request.headers.get("origin") or request.headers.get("referer") or "").strip()
+    if not raw:
+        return ""
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(raw)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    except Exception:
+        return ""
+    return ""
+
+
+def build_reset_password_url(raw_token: str, request: Optional[Request] = None) -> str:
+    env_override = str(os.environ.get("FRONTEND_RESET_PASSWORD_URL") or "").strip().rstrip("/")
+    origin = _request_frontend_origin(request)
+    if _is_dev_runtime() and origin and ("localhost" in origin or "127.0.0.1" in origin):
+        base = f"{origin}/reset-password"
+    elif env_override:
+        base = env_override
+    elif _is_dev_runtime():
+        base = "http://localhost:3001/reset-password"
+    elif FRONTEND_RESET_PASSWORD_URL:
         base = FRONTEND_RESET_PASSWORD_URL
     elif PUBLIC_FRONTEND_URL:
-        base = f"{PUBLIC_FRONTEND_URL}/reset-password"
+        base = f"{PUBLIC_FRONTEND_URL.rstrip('/')}/reset-password"
     else:
-        # fallback local dev
         base = "http://localhost:3000/reset-password"
     sep = "&" if "?" in base else "?"
     return f"{base}{sep}token={raw_token}"
@@ -942,6 +1081,11 @@ async def send_password_reset_email_resend_api(*, to_email: str, to_name: Option
     headers = {
         "Authorization": f"Bearer {SMTP_PASSWORD}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
     }
     async with aiohttp.ClientSession() as session:
         async with session.post(
@@ -954,17 +1098,36 @@ async def send_password_reset_email_resend_api(*, to_email: str, to_name: Option
             if resp.status >= 400:
                 raise RuntimeError(f"Resend API {resp.status}: {body[:500]}")
 
+def _resend_key_rejected(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        needle in text
+        for needle in (
+            "suspended",
+            "api key is invalid",
+            "invalid api key",
+            "invalid_api_key",
+            "suspended_api_key",
+        )
+    )
+
+
 async def send_password_reset_email(*, to_email: str, to_name: Optional[str], reset_url: str) -> None:
-    use_resend_api = SMTP_PASSWORD.startswith("re_") or SMTP_USERNAME.lower() == "resend" or (
-        SMTP_HOST or ""
-    ).endswith("resend.com")
+    use_resend_api = SMTP_PASSWORD.startswith("re_") or (SMTP_HOST or "").endswith("resend.com")
     if use_resend_api:
         try:
             await send_password_reset_email_resend_api(
                 to_email=to_email, to_name=to_name, reset_url=reset_url
             )
             return
-        except Exception:
+        except Exception as exc:
+            if _resend_key_rejected(exc):
+                logger.error(
+                    "Resend key rejected (%s). Create a new key at resend.com "
+                    "and set RESEND_API_KEY or password_reset.config.local.json",
+                    exc,
+                )
+                raise
             logger.exception("Resend API failed, falling back to SMTP to=%s", to_email)
     await asyncio.to_thread(
         send_password_reset_email_sync,
@@ -973,15 +1136,91 @@ async def send_password_reset_email(*, to_email: str, to_name: Optional[str], re
         reset_url=reset_url,
     )
 
+def _env_text(value: Optional[str]) -> str:
+    return str(value or "").strip()
+
+
+def google_oauth_is_configured() -> bool:
+    return bool(
+        _env_text(GOOGLE_OAUTH_CLIENT_ID)
+        and _env_text(GOOGLE_OAUTH_CLIENT_SECRET)
+        and _env_text(GOOGLE_OAUTH_REDIRECT_URI)
+    )
+
+
 def ensure_google_oauth_configured():
-    if not GOOGLE_OAUTH_CLIENT_ID or not GOOGLE_OAUTH_CLIENT_SECRET or not GOOGLE_OAUTH_REDIRECT_URI:
-        raise HTTPException(status_code=500, detail="Google OAuth is not configured")
+    if not google_oauth_is_configured():
+        raise HTTPException(status_code=503, detail="Connexion Google non configurée")
+
+
+def frontend_oauth_callback_url(tokens: Optional[dict] = None, error: Optional[str] = None) -> Optional[str]:
+    base = _env_text(FRONTEND_OAUTH_REDIRECT_URL)
+    if not base and PUBLIC_FRONTEND_URL:
+        base = f"{PUBLIC_FRONTEND_URL}/auth/callback"
+    if not base:
+        return None
+    params = {}
+    if error:
+        params["error"] = error
+    if tokens:
+        access = tokens.get("access_token") or tokens.get("token") or ""
+        refresh = tokens.get("refresh_token") or ""
+        if access:
+            params["access_token"] = access
+        if refresh:
+            params["refresh_token"] = refresh
+    if not params:
+        return base
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}{urlencode(params)}"
 
 def validate_oauth_state(request: Request, state: Optional[str]):
     expected_state = request.cookies.get("oauth_state") if request else None
     if expected_state:
         if not state or state != expected_state:
             raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+DEFAULT_MASK_AVATARS = [
+    "/avatars/mask-01.jpg",
+    "/avatars/mask-02.jpg",
+    "/avatars/mask-03.jpg",
+    "/avatars/mask-04.jpg",
+    "/avatars/mask-05.jpg",
+    "/avatars/mask-06.jpg",
+    "/avatars/mask-07.jpg",
+    "/avatars/mask-08.jpg",
+]
+
+
+def _fnv1a_32(text: str) -> int:
+    h = 2166136261
+    for ch in str(text or ""):
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def _is_mask_avatar(url: Optional[str]) -> bool:
+    return "/avatars/mask-" in str(url or "")
+
+
+def _default_mask_avatar(user_id: Optional[str]) -> str:
+    key = str(user_id or "artist")
+    return DEFAULT_MASK_AVATARS[_fnv1a_32(key) % len(DEFAULT_MASK_AVATARS)]
+
+
+async def _ensure_default_picture(user: Optional[dict]) -> Optional[dict]:
+    """Assign a stable default mask once; never overwrite a custom photo."""
+    if not user or not user.get("user_id"):
+        return user
+    picture = str(user.get("picture") or "").strip()
+    if picture:
+        return user
+    url = _default_mask_avatar(user["user_id"])
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"picture": url}})
+    user["picture"] = url
+    return user
+
 
 async def get_current_user(authorization: Optional[str] = Header(None), request: Request = None) -> dict:
     """Get current user from JWT token in Authorization header or session_token cookie"""
@@ -999,7 +1238,7 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
             token = authorization
     
     if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise HTTPException(status_code=401, detail="Connecte-toi pour continuer")
     
     # Check if it's a JWT token (custom auth)
     try:
@@ -1007,53 +1246,64 @@ async def get_current_user(authorization: Optional[str] = Header(None), request:
         token_type = payload.get("type")
         # Accepte les access tokens + les JWT legacy (sans champ type)
         if token_type and token_type != "access":
-            raise HTTPException(status_code=401, detail="Invalid token type")
+            raise HTTPException(status_code=401, detail="Session invalide")
         user_id = payload.get("user_id")
         if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(status_code=401, detail="Session invalide")
         
         user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
         if not user_doc:
-            raise HTTPException(status_code=401, detail="User not found")
+            raise HTTPException(status_code=401, detail="Compte introuvable")
         return await ensure_admin_flag(user_doc)
     except HTTPException:
         raise
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
+        raise HTTPException(status_code=401, detail="Session expirée, reconnecte-toi")
     except jwt.InvalidTokenError:
         pass
     
     # Check if it's a Google OAuth session token
     session_doc = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
     if not session_doc:
-        raise HTTPException(status_code=401, detail="Invalid session")
+        raise HTTPException(status_code=401, detail="Session invalide")
     
     # Check expiry
     expires_at = _parse_iso_dt(session_doc["expires_at"])
     if expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=401, detail="Session expired")
+        raise HTTPException(status_code=401, detail="Session expirée, reconnecte-toi")
     
     user_doc = await db.users.find_one({"user_id": session_doc["user_id"]}, {"_id": 0})
     if not user_doc:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="Compte introuvable")
 
     return await ensure_admin_flag(user_doc)
 
 def user_is_admin(user: Optional[dict]) -> bool:
     if not user:
         return False
-    return normalize_email(user.get("email") or "") in admin_emails()
+    email = user.get("email") or ""
+    if email_is_listed_admin(email):
+        return True
+    # Gmail +tag / dots of a listed address must never inherit admin, even if is_admin was persisted.
+    if is_unlisted_gmail_alias_of_admin(email):
+        return False
+    return bool(user.get("is_admin"))
 
 
 async def ensure_admin_flag(user: dict) -> dict:
-    """Persist is_admin when the account email is listed in ADMIN_EMAILS."""
-    if not user or user.get("is_admin"):
+    """Keep is_admin aligned with the exact allowlist; strip alias-based grants."""
+    if not user:
         return user
-    if not user_is_admin(user):
-        return user
-    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
-    user["is_admin"] = True
-    return user
+    email = user.get("email") or ""
+    if is_unlisted_gmail_alias_of_admin(email):
+        if user.get("is_admin"):
+            await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": False}})
+            user["is_admin"] = False
+        return await _ensure_default_picture(user)
+    if email_is_listed_admin(email) and not user.get("is_admin"):
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
+        user["is_admin"] = True
+    return await _ensure_default_picture(user)
 
 def user_response_from_doc(user: dict) -> UserResponse:
     return UserResponse(
@@ -1075,9 +1325,8 @@ def require_admin(user: dict) -> None:
 
 @api_router.post("/auth/register", response_model=UserResponse)
 async def register(user_data: UserRegister):
-    # Check if user exists
-    existing = await db.users.find_one({"email": user_data.email}, {"_id": 0})
-    if existing:
+    email = canonical_email(user_data.email)
+    if await find_user_by_email(email):
         raise HTTPException(status_code=400, detail="Email already registered")
     
     user_id = f"user_{uuid.uuid4().hex[:12]}"
@@ -1085,13 +1334,13 @@ async def register(user_data: UserRegister):
     
     user_doc = {
         "user_id": user_id,
-        "email": user_data.email,
+        "email": email,
         "password_hash": hashed_pwd,
         "name": user_data.name,
-        "picture": None,
+        "picture": _default_mask_avatar(user_id),
         "role": "artist" if user_data.artist_name else "user",
         "artist_name": user_data.artist_name,
-        "is_admin": normalize_email(user_data.email) in admin_emails(),
+        "is_admin": email_is_listed_admin(email),
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
@@ -1149,7 +1398,7 @@ async def refresh_auth(request: Request, response: Response):
     return await rotate_refresh_token(raw, response)
 
 @api_router.post("/auth/forgot-password")
-async def forgot_password(payload: ForgotPasswordRequest):
+async def forgot_password(payload: ForgotPasswordRequest, request: Request):
     """
     Toujours renvoyer un message générique pour éviter l'énumération des emails.
     En local/dev sans SMTP (ou si l'envoi échoue), on renvoie aussi le token/lien pour faciliter les tests.
@@ -1183,29 +1432,31 @@ async def forgot_password(payload: ForgotPasswordRequest):
         }
     )
 
-    reset_url = build_reset_password_url(raw_token)
+    reset_url = build_reset_password_url(raw_token, request)
     email_sent = False
-    if smtp_configured():
+    to_email = str(user_doc.get("email") or "").strip()
+    if smtp_configured() and to_email:
         try:
             await send_password_reset_email(
-                to_email=user_doc.get("email", ""),
+                to_email=to_email,
                 to_name=user_doc.get("name"),
                 reset_url=reset_url,
             )
             email_sent = True
-            logger.info("password-reset-email-sent user_id=%s to=%s", user_doc["user_id"], user_doc.get("email"))
+            logger.info("password-reset-email-sent user_id=%s to=%s", user_doc["user_id"], to_email)
         except Exception:
-            # Ne pas leak d'info côté client (email enum). Journaliser côté serveur.
-            logger.exception("password-reset-email-send-failed user_id=%s", user_doc["user_id"])
-    else:
+            logger.exception("password-reset-email-send-failed user_id=%s to=%s", user_doc["user_id"], to_email)
+    elif not smtp_configured():
         logger.warning(
             "SMTP non configuré : reset link en logs uniquement user_id=%s url=%s",
             user_doc["user_id"],
             reset_url,
         )
+    else:
+        logger.warning("password-reset skipped (empty email) user_id=%s", user_doc["user_id"])
 
-    # Dev / échec d'envoi hors prod : lien de secours pour ne pas bloquer
-    if _app_env != "production" and not email_sent:
+    # Uniquement en local/dev explicite — jamais si APP_ENV est oublié en prod.
+    if _allow_dev_reset_link() and not email_sent:
         return {
             "message": generic_message,
             "reset_token": raw_token,
@@ -1213,7 +1464,6 @@ async def forgot_password(payload: ForgotPasswordRequest):
             "expires_in_minutes": PASSWORD_RESET_TOKEN_TTL_MINUTES,
             "email_sent": False,
         }
-    # En production on ne renvoie jamais email_sent (évite l'énumération d'emails)
     return {"message": generic_message}
 
 @api_router.post("/auth/reset-password")
@@ -1250,10 +1500,15 @@ async def reset_password(payload: ResetPasswordRequest):
         {"token_hash": token_hash},
         {"$set": {"used_at": datetime.now(timezone.utc).isoformat()}},
     )
-    # Invalide les sessions OAuth éventuelles
     await db.user_sessions.delete_many({"user_id": user_doc["user_id"]})
+    await revoke_user_refresh_tokens(user_doc["user_id"])
 
     return {"message": "Mot de passe réinitialisé avec succès"}
+
+@api_router.get("/auth/google/status")
+async def google_oauth_status():
+    return {"configured": google_oauth_is_configured()}
+
 
 @api_router.get("/auth/google/login")
 async def google_login():
@@ -1315,9 +1570,8 @@ async def exchange_google_code_for_user(code: str) -> dict:
 
 async def upsert_google_user(user_info: dict) -> dict:
     """Create or update a user from Google profile data"""
-    email = user_info["email"]
-    is_admin = normalize_email(email) in admin_emails()
-    user_doc = await db.users.find_one({"email": email}, {"_id": 0})
+    email = canonical_email(user_info["email"])
+    user_doc = await find_user_by_email(email)
     if not user_doc:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         user_doc = {
@@ -1325,10 +1579,10 @@ async def upsert_google_user(user_info: dict) -> dict:
             "email": email,
             "password_hash": None,
             "name": user_info.get("name") or user_info.get("given_name") or "",
-            "picture": user_info.get("picture"),
+            "picture": str(user_info.get("picture") or "").strip() or _default_mask_avatar(user_id),
             "role": "user",
             "artist_name": None,
-            "is_admin": is_admin,
+            "is_admin": email_is_listed_admin(email),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await db.users.insert_one(user_doc)
@@ -1336,10 +1590,15 @@ async def upsert_google_user(user_info: dict) -> dict:
         user_id = user_doc["user_id"]
         update_fields = {
             "name": user_info.get("name") or user_info.get("given_name") or user_doc.get("name"),
-            "picture": user_info.get("picture"),
         }
-        if is_admin:
+        existing_picture = str(user_doc.get("picture") or "").strip()
+        if not existing_picture:
+            update_fields["picture"] = str(user_info.get("picture") or "").strip() or _default_mask_avatar(user_id)
+        # Never promote a Gmail-alias account just because Google returned the primary address.
+        if email_is_listed_admin(user_doc.get("email") or ""):
             update_fields["is_admin"] = True
+        elif is_unlisted_gmail_alias_of_admin(user_doc.get("email") or ""):
+            update_fields["is_admin"] = False
         await db.users.update_one(
             {"user_id": user_id},
             {"$set": update_fields},
@@ -1370,23 +1629,28 @@ async def google_callback_redirect(
     error: Optional[str] = None,
 ):
     """Handle Google redirect and then redirect back to frontend"""
+    fail_url = frontend_oauth_callback_url(error=error or ("code manquant" if not code else None))
     if error:
+        if fail_url:
+            return RedirectResponse(url=fail_url)
         raise HTTPException(status_code=401, detail=error)
     if not code:
+        if fail_url:
+            return RedirectResponse(url=fail_url)
         raise HTTPException(status_code=400, detail="Missing code")
 
     validate_oauth_state(request, state)
     user_info = await exchange_google_code_for_user(code)
     user_doc = await upsert_google_user(user_info)
 
-    redirect_url = FRONTEND_OAUTH_REDIRECT_URL
+    tokens = await create_google_session(user_doc["user_id"], None)
+    redirect_url = frontend_oauth_callback_url(tokens)
     if redirect_url:
         response = RedirectResponse(url=redirect_url)
-        tokens = await create_google_session(user_doc["user_id"], response)
+        set_auth_cookies(response, tokens["access_token"], tokens["refresh_token"])
         response.delete_cookie(key="oauth_state", path="/")
         return response
 
-    tokens = await create_google_session(user_doc["user_id"], response)
     response.delete_cookie(key="oauth_state", path="/")
     return GoogleSessionResponse(
         user_id=user_doc["user_id"],
@@ -1444,6 +1708,29 @@ async def update_user_settings(payload: UserSettings, authorization: Optional[st
     await db.user_settings.update_one({"user_id": user["user_id"]}, {"$set": data}, upsert=True)
     return payload
 
+
+class UserMeUpdate(BaseModel):
+    picture: Optional[str] = None
+    name: Optional[str] = None
+
+
+@api_router.put("/users/me", response_model=UserResponse)
+async def update_me(payload: UserMeUpdate, authorization: Optional[str] = Header(None), request: Request = None):
+    user = await get_current_user(authorization, request)
+    updates = {}
+    if payload.picture is not None:
+        picture = str(payload.picture).strip()
+        updates["picture"] = picture or None
+    if payload.name is not None:
+        name = str(payload.name).strip()
+        if name:
+            updates["name"] = name
+    if updates:
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
+        user.update(updates)
+    user = await _ensure_default_picture(user)
+    return user_response_from_doc(user)
+
 @api_router.post("/auth/logout")
 async def logout(
     response: Response,
@@ -1465,32 +1752,34 @@ async def logout(
 
 @api_router.put("/auth/role")
 async def update_role(new_role: str, artist_name: Optional[str] = None, authorization: Optional[str] = Header(None), request: Request = None):
-    """Toggle between user and artist role"""
+    """Passer d’auditeur à artiste (irréversible). Le rôle se choisit aussi à l’inscription."""
     user = await get_current_user(authorization, request)
     
     # Prevent privilege escalation through this endpoint.
     allowed = {"user", "artist"}
     if new_role not in allowed:
         raise HTTPException(status_code=400, detail="Invalid role")
+    if new_role == "user" and user.get("role") == "artist":
+        raise HTTPException(status_code=400, detail="Le rôle artiste ne peut pas être retiré")
     
-    # Si on passe en mode artist et qu'on a déjà un artist_name, le garder
-    if new_role == "artist":
-        # Si pas de nouveau nom fourni, garder l'ancien s'il existe
-        if not artist_name and user.get("artist_name"):
-            artist_name = user["artist_name"]
-        elif not artist_name:
-            raise HTTPException(status_code=400, detail="Artist name required for artist role")
-    
+    kept_name = str(artist_name or user.get("artist_name") or "").strip() or None
+    if new_role == "artist" and not kept_name:
+        raise HTTPException(status_code=400, detail="Artist name required for artist role")
+
     await db.users.update_one(
         {"user_id": user["user_id"]},
         {"$set": {
             "role": new_role,
-            "artist_name": artist_name if new_role == "artist" else user.get("artist_name"),
+            "artist_name": kept_name or user.get("artist_name"),
             "is_admin": user_is_admin(user),
         }}
     )
-    
-    return {"role": new_role, "artist_name": artist_name, "is_admin": user_is_admin(user)}
+
+    return {
+        "role": new_role,
+        "artist_name": kept_name or user.get("artist_name"),
+        "is_admin": user_is_admin(user),
+    }
 
 # ==================== ADMIN ROUTES ====================
 
@@ -1512,33 +1801,51 @@ async def admin_overview(authorization: Optional[str] = Header(None), request: R
     )
     paid = await paid_cursor.to_list(5000)
 
+    now = datetime.now(timezone.utc)
+    cutoff_day = (now - timedelta(days=29)).date().isoformat()
+
     gross_cents = 0
     fee_cents = 0
     seller_net_cents = 0
+    gross_30d = 0
+    fee_30d = 0
+    seller_30d = 0
     daily: dict[str, dict[str, int]] = {}
 
     for t in paid:
         try:
-            gross_cents += int(round(float(t.get("amount") or 0)))
+            amount = int(round(float(t.get("amount") or 0)))
         except (TypeError, ValueError):
-            pass
+            amount = 0
         try:
-            fee_cents += int(t.get("platform_fee_cents") or 0)
+            fee = int(t.get("platform_fee_cents") or 0)
         except (TypeError, ValueError):
-            pass
+            fee = 0
         try:
-            seller_net_cents += int(t.get("seller_amount_cents") or 0)
+            seller = int(t.get("seller_amount_cents") or 0)
         except (TypeError, ValueError):
-            pass
+            seller = 0
+
+        gross_cents += amount
+        fee_cents += fee
+        seller_net_cents += seller
 
         iso = t.get("created_at") or ""
         day = str(iso)[:10] if iso else ""
         if day:
             d = daily.setdefault(day, {"gross_cents": 0, "fee_cents": 0})
-            d["gross_cents"] += int(round(float(t.get("amount") or 0)))
-            d["fee_cents"] += int(t.get("platform_fee_cents") or 0)
+            d["gross_cents"] += amount
+            d["fee_cents"] += fee
+        if day and day >= cutoff_day:
+            gross_30d += amount
+            fee_30d += fee
+            seller_30d += seller
 
-    series = [{"day": k, **daily[k]} for k in sorted(daily.keys())][-30:]
+    series = []
+    for i in range(29, -1, -1):
+        day = (now - timedelta(days=i)).date().isoformat()
+        bucket = daily.get(day) or {"gross_cents": 0, "fee_cents": 0}
+        series.append({"day": day, "gross_cents": bucket["gross_cents"], "fee_cents": bucket["fee_cents"]})
 
     return {
         "counts": {
@@ -1554,6 +1861,9 @@ async def admin_overview(authorization: Optional[str] = Header(None), request: R
             "gross_cents": int(gross_cents),
             "platform_fees_cents": int(fee_cents),
             "seller_net_cents": int(seller_net_cents),
+            "gross_cents_30d": int(gross_30d),
+            "platform_fees_cents_30d": int(fee_30d),
+            "seller_net_cents_30d": int(seller_30d),
             "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
             "platform_fee_percent": float(get_platform_fee_percent()),
         },
@@ -2118,6 +2428,18 @@ async def get_contest_detail(contest_id: str, limit: int = Query(50, ge=1, le=20
     }
 
 
+def _profile_doc_for_response(profile: dict) -> dict:
+    doc = dict(profile or {})
+    doc["links"] = normalize_smart_links(doc.get("links"))
+    genres = doc.get("genres") or []
+    if isinstance(genres, str):
+        genres = [g.strip() for g in re.split(r"[,;/]+", genres) if g.strip()]
+    elif not isinstance(genres, list):
+        genres = []
+    doc["genres"] = [str(g).strip() for g in genres if str(g).strip()]
+    return doc
+
+
 # ==================== ARTIST PROFILE ROUTES ====================
 
 @api_router.post("/artist/profile", response_model=ArtistProfileResponse)
@@ -2141,13 +2463,19 @@ async def create_artist_profile(profile_data: ArtistProfileCreate, authorization
         "name": profile_data.name,
         "bio": profile_data.bio,
         "avatar_url": profile_data.avatar_url,
-        "links": profile_data.links or [],
+        "links": normalize_smart_links(profile_data.links),
+        "genres": [str(g).strip() for g in (profile_data.genres or []) if str(g).strip()],
         "created_at": now,
         "updated_at": now
     }
     
     await db.artist_profiles.insert_one(profile_doc)
-    return ArtistProfileResponse(**profile_doc)
+    if profile_data.name:
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"artist_name": profile_data.name}},
+        )
+    return ArtistProfileResponse(**_profile_doc_for_response(profile_doc))
 
 @api_router.get("/artist/profile", response_model=ArtistProfileResponse)
 async def get_my_artist_profile(authorization: Optional[str] = Header(None), request: Request = None):
@@ -2157,7 +2485,7 @@ async def get_my_artist_profile(authorization: Optional[str] = Header(None), req
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
     
-    return ArtistProfileResponse(**profile)
+    return ArtistProfileResponse(**_profile_doc_for_response(profile))
 
 @api_router.put("/artist/profile", response_model=ArtistProfileResponse)
 async def update_artist_profile(profile_data: ArtistProfileCreate, authorization: Optional[str] = Header(None), request: Request = None):
@@ -2166,16 +2494,41 @@ async def update_artist_profile(profile_data: ArtistProfileCreate, authorization
     if user["role"] != "artist":
         raise HTTPException(status_code=403, detail="Only artists can update profiles")
     
+    now = datetime.now(timezone.utc).isoformat()
     update_data = profile_data.model_dump()
-    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-    
+    update_data["links"] = normalize_smart_links(update_data.get("links"))
+    update_data["genres"] = [str(g).strip() for g in (update_data.get("genres") or []) if str(g).strip()]
+    update_data["updated_at"] = now
+
+    existing = await db.artist_profiles.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if not existing:
+        profile_doc = {
+            "profile_id": f"profile_{uuid.uuid4().hex[:12]}",
+            "user_id": user["user_id"],
+            "created_at": now,
+            **update_data,
+        }
+        await db.artist_profiles.insert_one(profile_doc)
+        if update_data.get("name"):
+            await db.users.update_one(
+                {"user_id": user["user_id"]},
+                {"$set": {"artist_name": update_data["name"]}},
+            )
+        return ArtistProfileResponse(**_profile_doc_for_response(profile_doc))
+
     await db.artist_profiles.update_one(
         {"user_id": user["user_id"]},
-        {"$set": update_data}
+        {"$set": update_data},
     )
-    
+    if update_data.get("name"):
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"artist_name": update_data["name"]}},
+        )
     profile = await db.artist_profiles.find_one({"user_id": user["user_id"]}, {"_id": 0})
-    return ArtistProfileResponse(**profile)
+    if not profile:
+        raise HTTPException(status_code=500, detail="Profil artiste introuvable")
+    return ArtistProfileResponse(**_profile_doc_for_response(profile))
 
 # ==================== UPLOAD ROUTES ====================
 
@@ -2331,7 +2684,13 @@ def _content_disposition_inline(filename: Optional[str], content_type: str) -> s
         return 'inline; filename="track"'
 
 
-def _audio_response_headers(content_type: str, filename: Optional[str], extra: Optional[dict] = None) -> dict:
+def _audio_response_headers(
+    content_type: str,
+    filename: Optional[str],
+    extra: Optional[dict] = None,
+    *,
+    private: bool = False,
+) -> dict:
     safe_type = content_type if isinstance(content_type, str) and content_type else "application/octet-stream"
     try:
         safe_type.encode("latin-1")
@@ -2341,7 +2700,7 @@ def _audio_response_headers(content_type: str, filename: Optional[str], extra: O
         "Accept-Ranges": "bytes",
         "Content-Type": safe_type,
         # no-transform: proxies (Caddy gzip) must not recode the stream — that breaks Range + WAV.
-        "Cache-Control": "public, max-age=86400, no-transform",
+        "Cache-Control": "private, max-age=0, no-transform" if private else "public, max-age=86400, no-transform",
         "X-Content-Type-Options": "nosniff",
         "Content-Disposition": _content_disposition_inline(filename, safe_type),
     }
@@ -2356,6 +2715,560 @@ def _audio_response_headers(content_type: str, filename: Optional[str], extra: O
                 continue
             headers[str(key)] = text
     return headers
+
+
+def _audio_file_id_from_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    match = re.search(r"/api/files/audio/([a-fA-F0-9]{24})", str(url))
+    return match.group(1) if match else None
+
+
+def _clip_wav_bytes(content: bytes, start_sec: int, duration_sec: int) -> Optional[bytes]:
+    try:
+        with wave.open(io.BytesIO(content), "rb") as reader:
+            rate = reader.getframerate()
+            channels = reader.getnchannels()
+            sample_width = reader.getsampwidth()
+            start_frame = max(0, int(start_sec)) * rate
+            count = max(1, int(duration_sec)) * rate
+            reader.setpos(min(start_frame, reader.getnframes()))
+            frames = reader.readframes(count)
+        out = io.BytesIO()
+        with wave.open(out, "wb") as writer:
+            writer.setnchannels(channels)
+            writer.setsampwidth(sample_width)
+            writer.setframerate(rate)
+            writer.writeframes(frames)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def _clip_with_ffmpeg(content: bytes, start_sec: int, duration_sec: int) -> Optional[bytes]:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.bin"
+            dst = Path(tmp) / "preview.mp3"
+            src.write_bytes(content)
+            cmd = [
+                ffmpeg,
+                "-y",
+                "-ss",
+                str(max(0, int(start_sec))),
+                "-t",
+                str(max(1, int(duration_sec))),
+                "-i",
+                str(src),
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "128k",
+                str(dst),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+            if dst.exists() and dst.stat().st_size > 0:
+                return dst.read_bytes()
+    except Exception:
+        logger.exception("ffmpeg preview generation failed")
+    return None
+
+
+async def _store_preview_bytes(content: bytes, *, user_id: str, filename: str, content_type: str) -> Optional[str]:
+    if not content:
+        return None
+    file_id = await fs.upload_from_stream(
+        filename=filename,
+        source=content,
+        metadata={
+            "kind": "audio_preview",
+            "content_type": content_type,
+            "uploader_user_id": user_id,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return f"/api/files/audio/{str(file_id)}"
+
+
+async def _preview_url_from_bytes(
+    content: bytes,
+    *,
+    user_id: str,
+    filename: str,
+    content_type: str,
+    start_sec: int = 0,
+    duration_sec: int = 15,
+) -> Optional[str]:
+    clip = await asyncio.to_thread(_clip_with_ffmpeg, content, start_sec, duration_sec)
+    stored_type = "audio/mpeg"
+    stored_name = "preview.mp3"
+    if not clip:
+        clip = await asyncio.to_thread(_clip_wav_bytes, content, start_sec, duration_sec)
+        stored_type = "audio/wav"
+        stored_name = "preview.wav"
+    if not clip:
+        return None
+    return await _store_preview_bytes(
+        clip,
+        user_id=user_id,
+        filename=stored_name,
+        content_type=stored_type,
+    )
+
+
+async def _read_gridfs_bytes(file_id: str) -> Optional[bytes]:
+    try:
+        grid_out = await fs.open_download_stream(ObjectId(file_id))
+        return await grid_out.read()
+    except Exception:
+        return None
+
+
+async def _preview_url_from_file_url(
+    file_url: str,
+    *,
+    user_id: str,
+    start_sec: int = 0,
+    duration_sec: int = 15,
+) -> Optional[str]:
+    file_id = _audio_file_id_from_url(file_url)
+    if not file_id:
+        return None
+    content = await _read_gridfs_bytes(file_id)
+    if not content:
+        return None
+    return await _preview_url_from_bytes(
+        content,
+        user_id=user_id,
+        filename="source.audio",
+        content_type="application/octet-stream",
+        start_sec=start_sec,
+        duration_sec=duration_sec,
+    )
+
+
+async def _prepare_track_audio_fields(payload: dict, *, existing: dict, user_id: str) -> dict:
+    out = dict(payload or {})
+    if "duration_sec" in out:
+        if "duration" not in out:
+            out["duration"] = out.get("duration_sec")
+        out.pop("duration_sec", None)
+    if "preview_duration_sec" in out:
+        if "preview_duration" not in out:
+            try:
+                out["preview_duration"] = max(1, int(out.get("preview_duration_sec") or 15))
+            except (TypeError, ValueError):
+                out["preview_duration"] = 15
+        out.pop("preview_duration_sec", None)
+
+    file_url = out.get("file_url") if "file_url" in out else existing.get("file_url")
+    preview_url = out.get("preview_url") if "preview_url" in out else existing.get("preview_url")
+    start = int(out.get("preview_start_time", existing.get("preview_start_time") or 0) or 0)
+    duration = int(out.get("preview_duration", existing.get("preview_duration") or 15) or 15)
+    old_start = int(existing.get("preview_start_time") or 0)
+    old_duration = int(existing.get("preview_duration") or 15)
+    file_changed = "file_url" in out and out.get("file_url") != existing.get("file_url")
+    window_changed = start != old_start or duration != old_duration
+    needs_preview = bool(file_url) and (
+        file_changed or window_changed or not preview_url or preview_url == file_url
+    )
+    if needs_preview:
+        generated = await _preview_url_from_file_url(
+            file_url,
+            user_id=user_id,
+            start_sec=start,
+            duration_sec=max(1, duration),
+        )
+        out["preview_url"] = generated or ""
+    return out
+
+
+def _track_duration_sec(track: Optional[dict]) -> Optional[int]:
+    raw = (track or {}).get("duration")
+    if raw is None or raw == "":
+        raw = (track or {}).get("duration_sec")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _merge_album_track_ids(album: Optional[dict], tracks: Optional[list]) -> List[str]:
+    album = album or {}
+    linked = [tid for tid in (album.get("track_ids") or []) if tid]
+    aid = album.get("album_id")
+    linked_set = set(linked)
+    extra = []
+    for track in tracks or []:
+        tid = track.get("track_id")
+        if not tid:
+            continue
+        if track.get("album_id") == aid or tid in linked_set:
+            extra.append(tid)
+    return list(dict.fromkeys([*linked, *extra]))
+
+
+async def _hydrate_album_track_ids(albums: List[dict]) -> List[dict]:
+    if not albums:
+        return []
+    album_ids = [a.get("album_id") for a in albums if a.get("album_id")]
+    stored_ids = [tid for a in albums for tid in (a.get("track_ids") or []) if tid]
+    clauses = []
+    if album_ids:
+        clauses.append({"album_id": {"$in": album_ids}})
+    if stored_ids:
+        clauses.append({"track_id": {"$in": stored_ids}})
+    tracks: List[dict] = []
+    if clauses:
+        tracks = await db.tracks.find(
+            {"$or": clauses},
+            {"_id": 0, "track_id": 1, "album_id": 1},
+        ).to_list(10000)
+    hydrated = []
+    for album in albums:
+        doc = dict(album)
+        doc["track_ids"] = _merge_album_track_ids(album, tracks)
+        hydrated.append(doc)
+    return hydrated
+
+
+def _has_audio_file(track: Optional[dict]) -> bool:
+    return bool(str((track or {}).get("file_url") or "").strip())
+
+
+def _ensure_published_has_audio(track: Optional[dict]) -> None:
+    if str((track or {}).get("status") or "") == "published" and not _has_audio_file(track):
+        raise HTTPException(status_code=400, detail="Un titre publié doit avoir un fichier audio")
+
+
+async def _album_member_tracks(album: Optional[dict]) -> List[dict]:
+    album = album or {}
+    aid = album.get("album_id")
+    ids = [tid for tid in (album.get("track_ids") or []) if tid]
+    clauses = []
+    if aid:
+        clauses.append({"album_id": aid})
+    if ids:
+        clauses.append({"track_id": {"$in": ids}})
+    if not clauses:
+        return []
+    return await db.tracks.find({"$or": clauses}, {"_id": 0}).to_list(1000)
+
+
+async def _sync_album_tracks_status(album: Optional[dict], *, status: str) -> List[dict]:
+    """Publie / dépublie les pistes de l'album. Publication : seulement celles avec audio.
+    Dépublier : uniquement les titres créés dans cet album (`album_id`)."""
+    album = album or {}
+    aid = album.get("album_id")
+    tracks = await _album_member_tracks(album)
+    now = datetime.now(timezone.utc).isoformat()
+    changed = []
+    for track in tracks:
+        previous = track.get("status")
+        if previous == status:
+            continue
+        if status == "published" and not _has_audio_file(track):
+            continue
+        if status == "draft" and track.get("album_id") != aid:
+            continue
+        await db.tracks.update_one(
+            {"track_id": track["track_id"]},
+            {"$set": {"status": status, "updated_at": now}},
+        )
+        updated = {**track, "status": status}
+        await _safe_notify(maybe_notify_published("track", previous, updated))
+        changed.append(updated)
+    return changed
+
+
+async def _ensure_album_can_publish(album: Optional[dict]) -> None:
+    members = await _album_member_tracks(album)
+    if not any(_has_audio_file(t) for t in members):
+        raise HTTPException(
+            status_code=400,
+            detail="Un album publié doit contenir au moins un titre avec audio",
+        )
+
+
+def _playable_preview_url(track: Optional[dict]) -> str:
+    """Play the uploaded file when possible (player keeps a 15s window).
+
+    Prefer `file_url` over a generated clip: a stale/wrong preview clip was
+    making catalog playback launch a different song than the clicked track.
+    """
+    data = track or {}
+    return str(data.get("file_url") or data.get("preview_url") or "").strip()
+
+
+def _track_response(track: dict, *, include_file: bool = False) -> TrackResponse:
+    data = dict(track or {})
+    file_url = str(data.get("file_url") or "").strip()
+    preview_url = _playable_preview_url(data)
+    data["preview_url"] = preview_url
+    data["file_url"] = file_url if include_file else None
+    data.setdefault("duration", None)
+    data.setdefault("description", None)
+    data.setdefault("mastering", None)
+    data.setdefault("splits", None)
+    data.setdefault("preview_start_time", 0)
+    data.setdefault("preview_duration", 15)
+    data.setdefault("likes_count", 0)
+    data.setdefault("play_count", 0)
+    return TrackResponse(**data)
+
+
+def _public_track_doc(track: dict) -> dict:
+    data = dict(track or {})
+    data["preview_url"] = _playable_preview_url(data)
+    data.pop("file_url", None)
+    return data
+
+
+async def _optional_user(authorization: Optional[str], request: Optional[Request]) -> Optional[dict]:
+    try:
+        return await get_current_user(authorization, request)
+    except Exception:
+        return None
+
+
+async def _user_from_audio_request(request: Request, authorization: Optional[str]) -> Optional[dict]:
+    token = None
+    if request:
+        token = request.query_params.get("token") or request.query_params.get("access_token")
+    if token:
+        fake_auth = f"Bearer {token}"
+        try:
+            return await get_current_user(fake_auth, None)
+        except Exception:
+            pass
+    return await _optional_user(authorization, request)
+
+
+def _parse_track_ids(raw: Optional[str], *, limit: int = 100) -> List[str]:
+    seen: List[str] = []
+    for part in str(raw or "").split(","):
+        tid = part.strip()
+        if not tid or tid in seen:
+            continue
+        seen.append(tid)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+async def _batch_owned_track_ids(user: Optional[dict], tracks: List[dict]) -> set:
+    if not user or not tracks:
+        return set()
+    if user_is_admin(user):
+        return {t["track_id"] for t in tracks if t.get("track_id")}
+    owned = {
+        t["track_id"]
+        for t in tracks
+        if t.get("track_id") and t.get("artist_id") == user.get("user_id")
+    }
+    tids = [t["track_id"] for t in tracks if t.get("track_id")]
+    album_ids = {t.get("album_id") for t in tracks if t.get("album_id")}
+    extra = []
+    if tids:
+        extra = await db.albums.find(
+            {"track_ids": {"$in": tids}},
+            {"_id": 0, "album_id": 1, "track_ids": 1},
+        ).to_list(500)
+    album_track_map = {}
+    for album in extra:
+        aid = album.get("album_id")
+        if aid:
+            album_ids.add(aid)
+        for tid in album.get("track_ids") or []:
+            album_track_map.setdefault(tid, set()).add(aid)
+    conds = []
+    if tids:
+        conds.append({"item_type": "track", "item_id": {"$in": tids}})
+    clean_albums = [aid for aid in album_ids if aid]
+    if clean_albums:
+        conds.append({"item_type": "album", "item_id": {"$in": clean_albums}})
+    if not conds:
+        return owned
+    purchases = await db.purchases.find(
+        {"user_id": user["user_id"], "$or": conds},
+        {"_id": 0, "item_type": 1, "item_id": 1},
+    ).to_list(4000)
+    bought_tracks = {p["item_id"] for p in purchases if p.get("item_type") == "track"}
+    bought_albums = {p["item_id"] for p in purchases if p.get("item_type") == "album"}
+    for track in tracks:
+        tid = track.get("track_id")
+        if not tid or tid in owned:
+            continue
+        if tid in bought_tracks:
+            owned.add(tid)
+            continue
+        aids = set(album_track_map.get(tid) or [])
+        if track.get("album_id"):
+            aids.add(track["album_id"])
+        if aids & bought_albums:
+            owned.add(tid)
+    return owned
+
+
+def _is_catalog_published(doc: Optional[dict]) -> bool:
+    return str((doc or {}).get("status") or "published").lower() in {"published", "public"}
+
+
+async def _catalog_visible_track_ids(tracks: List[dict]) -> set:
+    """Published tracks, plus draft members of a published album (legacy data)."""
+    visible = {t["track_id"] for t in tracks if t.get("track_id") and _is_catalog_published(t)}
+    pending = [t for t in tracks if t.get("track_id") and t["track_id"] not in visible]
+    if not pending:
+        return visible
+    tids = [t["track_id"] for t in pending]
+    aids = [t.get("album_id") for t in pending if t.get("album_id")]
+    clauses = []
+    if tids:
+        clauses.append({"track_ids": {"$in": tids}})
+    if aids:
+        clauses.append({"album_id": {"$in": aids}})
+    albums = await db.albums.find(
+        {"$or": clauses},
+        {"_id": 0, "album_id": 1, "track_ids": 1, "status": 1},
+    ).to_list(1000)
+    pub_album_ids = set()
+    pub_member_ids = set()
+    for album in albums:
+        if not _is_catalog_published(album):
+            continue
+        if album.get("album_id"):
+            pub_album_ids.add(album["album_id"])
+        for tid in album.get("track_ids") or []:
+            if tid:
+                pub_member_ids.add(tid)
+    for track in pending:
+        tid = track["track_id"]
+        if tid in pub_member_ids or track.get("album_id") in pub_album_ids:
+            visible.add(tid)
+    return visible
+
+
+def _catalog_status_query(status: Optional[str], user: Optional[dict]) -> Optional[dict]:
+    """Mongo fragment for public lists. None = no access (empty result)."""
+    wanted = (status or "").strip().lower()
+    if not wanted or wanted in {"published", "public"}:
+        return {"status": {"$nin": ["draft"]}}
+    if wanted == "draft":
+        if not user:
+            return None
+        if user_is_admin(user):
+            return {"status": "draft"}
+        return {"status": "draft", "artist_id": user.get("user_id")}
+    if user and user_is_admin(user):
+        return {"status": status}
+    return None
+
+
+async def _published_album_id_set() -> set:
+    albums = await db.albums.find(
+        {"status": {"$nin": ["draft"]}},
+        {"_id": 0, "album_id": 1},
+    ).to_list(5000)
+    return {a["album_id"] for a in albums if a.get("album_id")}
+
+
+async def _catalog_track_list_query(extra: Optional[dict] = None) -> dict:
+    """Published tracks, plus draft members of a published album."""
+    pub_albums = await _published_album_id_set()
+    status_ok = {"status": {"$nin": ["draft"]}}
+    visible = {"$or": [status_ok, {"album_id": {"$in": list(pub_albums)}}]} if pub_albums else status_ok
+    if extra:
+        return {"$and": [visible, extra]}
+    return visible
+
+
+async def _user_owns_album(user: Optional[dict], album: Optional[dict]) -> bool:
+    if not user or not album:
+        return False
+    if user_is_admin(user):
+        return True
+    if album.get("artist_id") == user.get("user_id"):
+        return True
+    purchased = await db.purchases.find_one(
+        {
+            "user_id": user["user_id"],
+            "item_type": "album",
+            "item_id": album.get("album_id"),
+        },
+        {"_id": 1},
+    )
+    return bool(purchased)
+
+
+async def _user_owns_track(user: Optional[dict], track: Optional[dict]) -> bool:
+    if not user or not track:
+        return False
+    if user_is_admin(user):
+        return True
+    if track.get("artist_id") == user.get("user_id"):
+        return True
+    conditions = [{"item_type": "track", "item_id": track.get("track_id")}]
+    album_ids = []
+    if track.get("album_id"):
+        album_ids.append(track["album_id"])
+    extra = await db.albums.find({"track_ids": track.get("track_id")}, {"_id": 0, "album_id": 1}).to_list(20)
+    album_ids.extend(a.get("album_id") for a in extra if a.get("album_id"))
+    for album_id in {aid for aid in album_ids if aid}:
+        conditions.append({"item_type": "album", "item_id": album_id})
+    purchased = await db.purchases.find_one({"user_id": user["user_id"], "$or": conditions}, {"_id": 1})
+    return bool(purchased)
+
+
+async def _audio_access_level(file_id: str, request: Request, authorization: Optional[str]) -> Optional[str]:
+    try:
+        oid = ObjectId(file_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid file id")
+    try:
+        grid_out = await fs.open_download_stream(oid)
+    except Exception:
+        raise HTTPException(status_code=404, detail="File not found")
+    meta = getattr(grid_out, "metadata", None) or {}
+    kind = str(meta.get("kind") or "")
+    file_url = f"/api/files/audio/{file_id}"
+    matches = await db.tracks.find(
+        {"$or": [{"file_url": file_url}, {"preview_url": file_url}]},
+        {"_id": 0},
+    ).to_list(50)
+
+    def _pick(field: str) -> Optional[dict]:
+        matched = [t for t in matches if str(t.get(field) or "") == file_url]
+        if not matched:
+            return None
+        published = [t for t in matched if _is_catalog_published(t)]
+        return (published or matched)[0]
+
+    as_full = _pick("file_url")
+    as_preview = _pick("preview_url")
+    if kind == "audio_preview" and not as_full:
+        return "preview"
+    user = await _user_from_audio_request(request, authorization)
+    if user and (user_is_admin(user) or meta.get("uploader_user_id") == user.get("user_id")):
+        return "full"
+    if as_full and await _user_owns_track(user, as_full):
+        return "full"
+    if as_full and (
+        _is_catalog_published(as_full)
+        or as_full.get("track_id") in await _catalog_visible_track_ids([as_full])
+    ):
+        return "preview"
+    if as_preview and (
+        kind == "audio_preview"
+        or _is_catalog_published(as_preview)
+        or as_preview.get("track_id") in await _catalog_visible_track_ids([as_preview])
+    ):
+        return "preview"
+    return None
 
 
 @api_router.post("/upload/audio")
@@ -2382,19 +3295,42 @@ async def upload_audio(file: UploadFile = File(...), authorization: Optional[str
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
         },
     )
+    file_url = f"/api/files/audio/{str(file_id)}"
+    preview_url = await _preview_url_from_bytes(
+        content,
+        user_id=user["user_id"],
+        filename=filename,
+        content_type=content_type,
+        start_sec=0,
+        duration_sec=15,
+    )
 
-    return {"file_url": f"/api/files/audio/{str(file_id)}"}
+    return {"file_url": file_url, "preview_url": preview_url or ""}
+
+def _looks_like_image(content: bytes, content_type: Optional[str]) -> bool:
+    ct = str(content_type or "").lower()
+    if ct.startswith("image/"):
+        return True
+    return (
+        content[:3] == b"\xff\xd8\xff"
+        or content[:8] == b"\x89PNG\r\n\x1a\n"
+        or content[:6] in {b"GIF87a", b"GIF89a"}
+        or content[:4] == b"RIFF"
+        or content[:4] == b"\x00\x00\x01\x00"
+    )
+
 
 @api_router.post("/upload/cover")
 async def upload_cover(file: UploadFile = File(...), authorization: Optional[str] = Header(None), request: Request = None):
     user = await get_current_user(authorization, request)
-    
-    if user["role"] != "artist":
-        raise HTTPException(status_code=403, detail="Only artists can upload covers")
 
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image trop lourde (8 Mo max)")
+    if not _looks_like_image(content, file.content_type):
+        raise HTTPException(status_code=400, detail="Fichier image requis")
 
     file_id = await fs.upload_from_stream(
         filename=file.filename or f"{uuid.uuid4().hex}.cover",
@@ -2409,7 +3345,7 @@ async def upload_cover(file: UploadFile = File(...), authorization: Optional[str
 
     return {"cover_url": f"/api/files/covers/{str(file_id)}"}
 
-async def _stream_audio_file(file_id: str, request: Request):
+async def _stream_audio_file(file_id: str, request: Request, *, private: bool = False):
     try:
         oid = ObjectId(file_id)
     except Exception:
@@ -2446,6 +3382,7 @@ async def _stream_audio_file(file_id: str, request: Request):
                 content_type,
                 filename,
                 {"Content-Range": f"bytes */{file_size}"},
+                private=private,
             ),
         )
 
@@ -2473,6 +3410,7 @@ async def _stream_audio_file(file_id: str, request: Request):
                     "Content-Range": f"bytes {start}-{end}/{file_size}",
                     "Content-Length": str(end - start + 1),
                 },
+                private=private,
             ),
         )
 
@@ -2490,14 +3428,18 @@ async def _stream_audio_file(file_id: str, request: Request):
             content_type,
             filename,
             {"Content-Length": str(file_size)},
+            private=private,
         ),
     )
 
 
 @api_router.get("/files/audio/{file_id}")
-async def get_audio_file(file_id: str, request: Request):
+async def get_audio_file(file_id: str, request: Request, authorization: Optional[str] = Header(None)):
     try:
-        return await _stream_audio_file(file_id, request)
+        access = await _audio_access_level(file_id, request, authorization)
+        if not access:
+            raise HTTPException(status_code=403, detail="Achat requis pour le fichier complet")
+        return await _stream_audio_file(file_id, request, private=access == "full")
     except HTTPException:
         raise
     except Exception:
@@ -2576,7 +3518,7 @@ async def create_track(track_data: TrackCreate, authorization: Optional[str] = H
         "availability": track_data.availability,
         "producer": track_data.producer,
         "beatmaker": track_data.beatmaker,
-        "status": track_data.status,
+        "status": "draft",
         "likes_count": 0,
         "play_count": 0,
         "created_at": datetime.now(timezone.utc).isoformat()
@@ -2587,32 +3529,61 @@ async def create_track(track_data: TrackCreate, authorization: Optional[str] = H
     return TrackResponse(**track_doc)
 
 @api_router.get("/tracks", response_model=List[TrackResponse])
-async def get_tracks(limit: int = 50, skip: int = 0, genre: Optional[str] = None, status: Optional[str] = None, authorization: Optional[str] = Header(None), request: Request = None):
-    # Get current user if authenticated
-    try:
-        user = await get_current_user(authorization, request) if authorization else None
-    except:
-        user = None
-    
-    query = {}
-    if genre:
-        query["genre"] = genre
-    
-    # Only show published tracks unless user is viewing their own tracks
-    if status:
-        query["status"] = status
-    elif not user:
-        query["status"] = "published"
-    
-    tracks = await db.tracks.find(query, {"_id": 0}).skip(skip).limit(limit).to_list(limit)
-    return [TrackResponse(**track) for track in tracks]
+async def get_tracks(
+    limit: int = 50,
+    skip: int = 0,
+    genre: Optional[str] = None,
+    status: Optional[str] = None,
+    ids: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    id_list = _parse_track_ids(ids)
+    if id_list:
+        user = await _optional_user(authorization, request)
+        found = await db.tracks.find({"track_id": {"$in": id_list}}, {"_id": 0}).to_list(len(id_list))
+        owned_ids = await _batch_owned_track_ids(user, found)
+        listed_ids = await _catalog_visible_track_ids(found)
+        visible = []
+        for track in found:
+            tid = track.get("track_id")
+            if tid in listed_ids or tid in owned_ids:
+                visible.append(track)
+        by_id = {t["track_id"]: t for t in visible if t.get("track_id")}
+        ordered = [by_id[tid] for tid in id_list if tid in by_id]
+        return [
+            _track_response(track, include_file=track.get("track_id") in owned_ids)
+            for track in ordered
+        ]
+
+    user = await _optional_user(authorization, request)
+    status_q = _catalog_status_query(status, user)
+    if status_q is None:
+        return []
+
+    wanted = (status or "").strip().lower()
+    extra = {"genre": genre} if genre else None
+    if not wanted or wanted in {"published", "public"}:
+        query = await _catalog_track_list_query(extra)
+    else:
+        query = dict(status_q)
+        if extra:
+            query.update(extra)
+
+    tracks = await db.tracks.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    return [_track_response(track, include_file=False) for track in tracks]
 
 @api_router.get("/tracks/{track_id}", response_model=TrackResponse)
-async def get_track(track_id: str):
+async def get_track(track_id: str, authorization: Optional[str] = Header(None), request: Request = None):
     track = await db.tracks.find_one({"track_id": track_id}, {"_id": 0})
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    return TrackResponse(**track)
+    user = await _optional_user(authorization, request)
+    owned = await _user_owns_track(user, track)
+    listed = track.get("track_id") in await _catalog_visible_track_ids([track])
+    if not listed and not owned:
+        raise HTTPException(status_code=404, detail="Track not found")
+    return _track_response(track, include_file=owned)
 
 @api_router.put("/tracks/{track_id}")
 async def update_track(track_id: str, track_data: dict, authorization: Optional[str] = Header(None), request: Request = None):
@@ -2626,11 +3597,16 @@ async def update_track(track_id: str, track_data: dict, authorization: Optional[
         raise HTTPException(status_code=403, detail="Not authorized")
     
     previous_status = track.get("status")
-    await db.tracks.update_one({"track_id": track_id}, {"$set": track_data})
+    prepared = await _prepare_track_audio_fields(track_data, existing=track, user_id=user["user_id"])
+    _ensure_published_has_audio({
+        "status": prepared.get("status", track.get("status")),
+        "file_url": prepared["file_url"] if "file_url" in prepared else track.get("file_url"),
+    })
+    await db.tracks.update_one({"track_id": track_id}, {"$set": prepared})
     
     updated_track = await db.tracks.find_one({"track_id": track_id}, {"_id": 0})
     await _safe_notify(maybe_notify_published("track", previous_status, updated_track))
-    return TrackResponse(**updated_track)
+    return _track_response(updated_track, include_file=True)
 
 @api_router.delete("/tracks/{track_id}")
 async def delete_track(track_id: str, authorization: Optional[str] = Header(None), request: Request = None):
@@ -2682,16 +3658,31 @@ async def create_album(album_data: AlbumCreate, authorization: Optional[str] = H
     return AlbumResponse(**album_doc)
 
 @api_router.get("/albums", response_model=List[AlbumResponse])
-async def get_albums(limit: int = 50, skip: int = 0):
-    albums = await db.albums.find({}, {"_id": 0}).skip(skip).limit(limit).to_list(limit)
-    return [AlbumResponse(**album) for album in albums]
+async def get_albums(
+    limit: int = 50,
+    skip: int = 0,
+    status: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await _optional_user(authorization, request)
+    status_q = _catalog_status_query(status, user)
+    if status_q is None:
+        return []
+    albums = await db.albums.find(status_q, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    hydrated = await _hydrate_album_track_ids(albums)
+    return [AlbumResponse(**album) for album in hydrated]
 
 @api_router.get("/albums/{album_id}", response_model=AlbumResponse)
-async def get_album(album_id: str):
+async def get_album(album_id: str, authorization: Optional[str] = Header(None), request: Request = None):
     album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
     if not album:
         raise HTTPException(status_code=404, detail="Album not found")
-    return AlbumResponse(**album)
+    user = await _optional_user(authorization, request)
+    if not _is_catalog_published(album) and not await _user_owns_album(user, album):
+        raise HTTPException(status_code=404, detail="Album not found")
+    hydrated = await _hydrate_album_track_ids([album])
+    return AlbumResponse(**hydrated[0])
 
 @api_router.put("/albums/{album_id}")
 async def update_album(album_id: str, album_data: dict, authorization: Optional[str] = Header(None), request: Request = None):
@@ -2705,11 +3696,24 @@ async def update_album(album_id: str, album_data: dict, authorization: Optional[
         raise HTTPException(status_code=403, detail="Not authorized")
     
     previous_status = album.get("status")
-    await db.albums.update_one({"album_id": album_id}, {"$set": album_data})
+    payload = dict(album_data or {})
+    track_ids = payload.get("track_ids")
+    if "track_ids" in payload and not (isinstance(track_ids, list) and len(track_ids) > 0):
+        payload.pop("track_ids", None)
+    next_status = payload.get("status", previous_status)
+    preview_album = {**album, **payload}
+    if next_status == "published":
+        await _ensure_album_can_publish(preview_album)
+    await db.albums.update_one({"album_id": album_id}, {"$set": payload})
     
     updated_album = await db.albums.find_one({"album_id": album_id}, {"_id": 0})
+    if next_status == "published":
+        await _sync_album_tracks_status(updated_album, status="published")
+    elif next_status == "draft" and previous_status == "published":
+        await _sync_album_tracks_status(updated_album, status="draft")
     await _safe_notify(maybe_notify_published("album", previous_status, updated_album))
-    return AlbumResponse(**updated_album)
+    hydrated = await _hydrate_album_track_ids([updated_album])
+    return AlbumResponse(**hydrated[0])
 
 @api_router.delete("/albums/{album_id}")
 async def delete_album(album_id: str, authorization: Optional[str] = Header(None), request: Request = None):
@@ -2772,7 +3776,7 @@ async def create_album_track(album_id: str, track_data: AlbumTrackCreate, author
         "availability": track_data.availability,
         "producer": track_data.producer,
         "beatmaker": track_data.beatmaker,
-        "status": track_data.status,
+        "status": "draft",
         "likes_count": 0,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
@@ -2803,7 +3807,12 @@ async def update_album_track(album_id: str, track_id: str, payload: dict, author
         raise HTTPException(status_code=404, detail="Track not found in this album")
 
     previous_status = track.get("status")
-    await db.tracks.update_one({"track_id": track_id}, {"$set": payload})
+    prepared = await _prepare_track_audio_fields(payload, existing=track, user_id=user["user_id"])
+    _ensure_published_has_audio({
+        "status": prepared.get("status", track.get("status")),
+        "file_url": prepared["file_url"] if "file_url" in prepared else track.get("file_url"),
+    })
+    await db.tracks.update_one({"track_id": track_id}, {"$set": prepared})
     updated = await db.tracks.find_one({"track_id": track_id}, {"_id": 0})
     await _safe_notify(maybe_notify_published("track", previous_status, updated))
     return AlbumTrackResponse(**updated)
@@ -2811,12 +3820,17 @@ async def update_album_track(album_id: str, track_id: str, payload: dict, author
 # ==================== ARTIST ROUTES ====================
 
 def _custom_avatar_url(*candidates) -> Optional[str]:
-    """URL choisi par l’artiste. Les masques par défaut restent côté front."""
+    """Photo perso en priorité, sinon le masque déjà stocké."""
+    fallback = None
     for raw in candidates:
         value = str(raw or "").strip()
-        if value and "/avatars/mask-" not in value:
+        if not value:
+            continue
+        if not _is_mask_avatar(value):
             return value
-    return None
+        if fallback is None:
+            fallback = value
+    return fallback
 
 
 async def _apply_custom_avatars(artists: list) -> None:
@@ -2830,9 +3844,12 @@ async def _apply_custom_avatars(artists: list) -> None:
     by_id = {p["user_id"]: p for p in profiles}
     for artist in artists:
         profile = by_id.get(artist.get("user_id")) or {}
-        custom = _custom_avatar_url(profile.get("avatar_url"), artist.get("picture"))
-        artist["avatar_url"] = profile.get("avatar_url") or None
-        artist["picture"] = custom
+        artist["avatar_url"] = str(profile.get("avatar_url") or "").strip() or None
+        chosen = _custom_avatar_url(profile.get("avatar_url"), artist.get("picture"))
+        if not chosen:
+            await _ensure_default_picture(artist)
+            chosen = artist.get("picture")
+        artist["picture"] = chosen
 
 @api_router.get("/artists")
 async def get_artists(limit: int = 50):
@@ -2848,15 +3865,92 @@ async def get_artist(artist_id: str):
 
     await _apply_custom_avatars([artist])
     
-    # Get artist's tracks
-    tracks = await db.tracks.find({"artist_id": artist_id}, {"_id": 0}).to_list(100)
-    artist["tracks"] = tracks
-    
-    # Get artist's albums
-    albums = await db.albums.find({"artist_id": artist_id}, {"_id": 0}).to_list(100)
-    artist["albums"] = albums
+    tracks = await db.tracks.find({"artist_id": artist_id}, {"_id": 0}).to_list(200)
+    visible_ids = await _catalog_visible_track_ids(tracks)
+    artist["tracks"] = [
+        _public_track_doc(track) for track in tracks if track.get("track_id") in visible_ids
+    ]
+
+    albums = await db.albums.find(
+        {"artist_id": artist_id, "status": {"$nin": ["draft"]}},
+        {"_id": 0},
+    ).to_list(100)
+    artist["albums"] = await _hydrate_album_track_ids(albums)
+
+    profile = await db.artist_profiles.find_one({"user_id": artist_id}, {"_id": 0})
+    if profile:
+        ready = _profile_doc_for_response(profile)
+        artist["bio"] = ready.get("bio") or artist.get("bio")
+        artist["links"] = ready.get("links") or []
+        artist["genres"] = ready.get("genres") or []
+        if ready.get("avatar_url"):
+            artist["avatar_url"] = ready.get("avatar_url")
+    else:
+        artist["links"] = []
+        artist["genres"] = []
     
     return artist
+
+# ==================== SHARE / OPEN GRAPH ====================
+
+@api_router.get("/og/track/{track_id}", response_class=HTMLResponse)
+async def og_track(track_id: str, request: Request):
+    track = await db.tracks.find_one({"track_id": track_id, "status": {"$ne": "draft"}}, {"_id": 0})
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    origin = public_origin(request)
+    title = f"{track.get('title') or 'Titre'} — {track.get('artist_name') or 'Kloud'}"
+    desc = (track.get("description") or track.get("genre") or "Écoute le preview et achète sur Kloud.")
+    return og_html(
+        title=title,
+        description=str(desc),
+        url=f"{origin}/track/{track_id}",
+        image=absolute_url(track.get("cover_url"), request),
+        og_type="music.song",
+    )
+
+
+@api_router.get("/og/artist/{artist_id}", response_class=HTMLResponse)
+async def og_artist(artist_id: str, request: Request):
+    artist = await db.users.find_one({"user_id": artist_id, "role": "artist"}, {"_id": 0, "password_hash": 0})
+    if not artist:
+        raise HTTPException(status_code=404, detail="Artist not found")
+    await _apply_custom_avatars([artist])
+    profile = await db.artist_profiles.find_one({"user_id": artist_id}, {"_id": 0}) or {}
+    origin = public_origin(request)
+    name = artist.get("artist_name") or artist.get("name") or "Artiste"
+    desc = profile.get("bio") or f"Écoute {name} sur Kloud."
+    image = profile.get("avatar_url") or artist.get("picture")
+    return og_html(
+        title=f"{name} — Kloud",
+        description=str(desc),
+        url=f"{origin}/artist/{artist_id}",
+        image=absolute_url(image, request),
+        og_type="profile",
+    )
+
+
+@api_router.get("/og/album/{album_id}", response_class=HTMLResponse)
+async def og_album(album_id: str, request: Request):
+    album = await db.albums.find_one({"album_id": album_id, "status": {"$ne": "draft"}}, {"_id": 0})
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+    origin = public_origin(request)
+    title = f"{album.get('title') or 'Album'} — {album.get('artist_name') or 'Kloud'}"
+    desc = album.get("description") or "Écoute et achète cet album sur Kloud."
+    return og_html(
+        title=title,
+        description=str(desc),
+        url=f"{origin}/album/{album_id}",
+        image=absolute_url(album.get("cover_url"), request),
+        og_type="music.album",
+    )
+
+
+@api_router.get("/share/qr.svg")
+async def share_qr(u: str, request: Request):
+    target = allowed_share_target(u, request)
+    return qr_svg_response(target)
 
 # ==================== PLAYLIST ROUTES ====================
 
@@ -2892,9 +3986,9 @@ async def get_playlist(playlist_id: str, authorization: Optional[str] = Header(N
 
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
 
     return PlaylistResponse(**playlist)
 
@@ -2904,9 +3998,9 @@ async def update_playlist(playlist_id: str, payload: PlaylistUpdate, authorizati
 
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
 
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not update_data:
@@ -2924,10 +4018,10 @@ async def update_playlist_tracks(playlist_id: str, track_ids: List[str], authori
     
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
     
     await db.playlists.update_one(
         {"playlist_id": playlist_id},
@@ -2948,9 +4042,9 @@ async def add_track_to_playlist(playlist_id: str, payload: PlaylistTrackAdd, aut
 
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
 
     track_id = payload.track_id
     exists = await db.tracks.find_one({"track_id": track_id}, {"_id": 1})
@@ -2972,9 +4066,9 @@ async def remove_track_from_playlist(playlist_id: str, track_id: str, authorizat
 
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
 
     await db.playlists.update_one(
         {"playlist_id": playlist_id},
@@ -2988,10 +4082,10 @@ async def delete_playlist(playlist_id: str, authorization: Optional[str] = Heade
     
     playlist = await db.playlists.find_one({"playlist_id": playlist_id}, {"_id": 0})
     if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
+        raise HTTPException(status_code=404, detail="Playlist introuvable")
     
     if playlist["user_id"] != user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+        raise HTTPException(status_code=403, detail="Action non autorisée")
     
     await db.playlists.delete_one({"playlist_id": playlist_id})
     return {"message": "Playlist deleted"}
@@ -3334,7 +4428,9 @@ async def get_likes(authorization: Optional[str] = Header(None), request: Reques
 @api_router.get("/likes/state")
 async def get_likes_state(item_type: str, ids: str, authorization: Optional[str] = Header(None), request: Request = None):
     """Return a map {id: boolean} for the given item_type and comma-separated ids."""
-    user = await get_current_user(authorization, request)
+    user = await _optional_user(authorization, request)
+    if not user:
+        return {}
 
     id_list = [i.strip() for i in (ids or "").split(",") if i.strip()]
     if not id_list:
@@ -3370,7 +4466,7 @@ async def get_likes_summary(limit: int = 200, authorization: Optional[str] = Hea
     await _apply_custom_avatars(liked_artists)
 
     return {
-        "tracks": [track_by_id[i] for i in track_ids if i in track_by_id],
+        "tracks": [_public_track_doc(track_by_id[i]) for i in track_ids if i in track_by_id],
         "albums": [album_by_id[i] for i in album_ids if i in album_by_id],
         "artists": liked_artists,
     }
@@ -3456,33 +4552,8 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
         "Album" if checkout_data.item_type == "album" else "Track"
     )
 
-    connect_account_id = seller.get("stripe_connect_account_id")
     fee_cents = compute_platform_fee_cents(amount_total_cents)
-    use_connect = (
-        stripe_connect_enabled()
-        and amount_total_cents > 0
-        and bool(connect_account_id)
-    )
-
-    if stripe_connect_enabled() and amount_total_cents > 0:
-        if not connect_account_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Ce vendeur n'a pas encore activé les paiements (Stripe Connect). Réessaie plus tard.",
-            )
-        try:
-            acct = await asyncio.to_thread(retrieve_connect_account, connect_account_id)
-            if not getattr(acct, "charges_enabled", False):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Le vendeur n'a pas terminé l'activation des paiements Stripe.",
-                )
-        except HTTPException:
-            raise
-        except stripe.error.StripeError as e:
-            logger.warning("Stripe Connect account: %s", e, exc_info=True)
-            msg = getattr(e, "user_message", None) or getattr(e, "message", None) or str(e)
-            raise HTTPException(status_code=502, detail=f"Stripe Connect: {msg}")
+    seller_amount_cents = max(0, int(amount_total_cents) - int(fee_cents))
 
     try:
         session_result = await create_checkout_session(
@@ -3493,16 +4564,12 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
             item_id=item_id,
             origin_url=checkout_data.origin_url,
             artist_id=artist_id,
-            connect_account_id=connect_account_id if use_connect else None,
-            platform_fee_cents=fee_cents if use_connect else None,
         )
     except stripe.error.StripeError as e:
         # Clé invalide, réseau, paramètres Stripe, etc. — éviter une 500 sans message.
         logger.warning("Stripe checkout session: %s", e, exc_info=True)
         msg = getattr(e, "user_message", None) or getattr(e, "message", None) or str(e)
         raise HTTPException(status_code=502, detail=f"Stripe: {msg}")
-
-    seller_amount = float(amount_total_cents - fee_cents) if use_connect else float(amount_total_cents)
 
     transaction_doc = {
         "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
@@ -3512,14 +4579,16 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
         "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
         "status": "pending",
         "payment_status": "pending",
+        "settlement": "wallet",
+        "wallet_credited": False,
         "metadata": {
             "item_type": checkout_data.item_type,
             "item_id": item_id,
         },
         "artist_id": artist_id,
-        "stripe_connect_account_id": connect_account_id if use_connect else None,
-        "platform_fee_cents": int(fee_cents) if use_connect else 0,
-        "seller_amount_cents": int(round(seller_amount)) if use_connect else int(amount_total_cents),
+        "stripe_connect_account_id": None,
+        "platform_fee_cents": int(fee_cents),
+        "seller_amount_cents": int(seller_amount_cents),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -3536,9 +4605,10 @@ async def create_checkout(checkout_data: CheckoutRequest, authorization: Optiona
             "artist_id": artist_id,
             "amount_cents": int(amount_total_cents),
             "currency": os.environ.get("STRIPE_CURRENCY", "eur"),
-            "connect_used": bool(use_connect),
-            "platform_fee_cents": int(fee_cents) if use_connect else 0,
-            "seller_net_cents": int(round(seller_amount)) if use_connect else int(amount_total_cents),
+            "connect_used": False,
+            "settlement": "wallet",
+            "platform_fee_cents": int(fee_cents),
+            "seller_net_cents": int(seller_amount_cents),
         },
     )
 
@@ -3675,6 +4745,8 @@ async def get_checkout_status(session_id: str, authorization: Optional[str] = He
                 amount_cents=price_paid,
             ))
 
+        await _credit_artist_wallet_from_paid_transaction(transaction)
+
         await log_transaction_event(
             kind="checkout_paid",
             data={
@@ -3787,7 +4859,10 @@ async def get_library(authorization: Optional[str] = Header(None), request: Requ
         if purchase["item_type"] == "track":
             track = await db.tracks.find_one({"track_id": purchase["item_id"]}, {"_id": 0})
             if track:
-                library["tracks"].append(track)
+                try:
+                    library["tracks"].append(_track_response(track, include_file=True).model_dump())
+                except Exception:
+                    library["tracks"].append(track)
         else:
             album = await db.albums.find_one({"album_id": purchase["item_id"]}, {"_id": 0})
             if album:
@@ -3840,7 +4915,9 @@ async def get_my_follows(limit: int = 200, authorization: Optional[str] = Header
 
 @api_router.get("/follows/state")
 async def get_follow_state(artist_ids: str, authorization: Optional[str] = Header(None), request: Request = None):
-    user = await get_current_user(authorization, request)
+    user = await _optional_user(authorization, request)
+    if not user:
+        return {}
     ids_list = [i.strip() for i in (artist_ids or "").split(",") if i.strip()]
     if not ids_list:
         return {}
@@ -3946,6 +5023,9 @@ async def fulfill_checkout_session_completed(sess) -> None:
                     item_id=item_id,
                     amount_cents=price_paid or 0,
                 ))
+
+        if transaction:
+            await _credit_artist_wallet_from_paid_transaction(transaction)
 
         await log_transaction_event(
             kind="checkout_completed",
@@ -4087,14 +5167,23 @@ async def artist_stripe_connect_status(authorization: Optional[str] = Header(Non
 
 
 @api_router.post("/artist/stripe/connect/onboard")
-async def artist_stripe_connect_onboard(authorization: Optional[str] = Header(None), request: Request = None):
+async def artist_stripe_connect_onboard(
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+    return_to: Optional[str] = Query(None),
+):
     user = await get_current_user(authorization, request)
     if user.get("role") != "artist":
         raise HTTPException(status_code=403, detail="Réservé aux artistes")
     ensure_stripe_available()
     base = os.environ.get("PUBLIC_FRONTEND_URL", "https://localhost:3000").rstrip("/")
-    refresh_url = f"{base}/artist-dashboard?connect=refresh"
-    return_url = f"{base}/artist-dashboard?connect=return"
+    dest = (return_to or "").strip().lower()
+    if dest == "settings":
+        refresh_url = f"{base}/settings?tab=artist&connect=refresh"
+        return_url = f"{base}/settings?tab=artist&connect=return"
+    else:
+        refresh_url = f"{base}/artist-dashboard?connect=refresh"
+        return_url = f"{base}/artist-dashboard?connect=return"
 
     acct_id = user.get("stripe_connect_account_id")
     try:
@@ -4156,15 +5245,204 @@ async def artist_stripe_connect_balance(authorization: Optional[str] = Header(No
     cur = STRIPE_CURRENCY_ENV
     available = _balance_amount_for_currency(bal, "available", cur)
     pending = _balance_amount_for_currency(bal, "pending", cur)
-    try:
-        hint = float(os.environ.get("STRIPE_MIN_PAYOUT_HINT_EUROS", "20"))
-    except (TypeError, ValueError):
-        hint = 20.0
+    min_cents = get_min_payout_cents()
     return {
         "currency": cur,
         "available_cents": available,
         "pending_cents": pending,
-        "min_payout_hint_euros": hint,
+        "min_payout_hint_euros": round(min_cents / 100.0, 2),
+    }
+
+
+@api_router.get("/artist/wallet")
+async def artist_wallet(authorization: Optional[str] = Header(None), request: Request = None):
+    """Cagnotte Kloud : ventes encaissées sur la plateforme, à retirer via Stripe Connect."""
+    user = await get_current_user(authorization, request)
+    if user.get("role") != "artist":
+        raise HTTPException(status_code=403, detail="Réservé aux artistes")
+
+    available = _as_int_cents(user.get("wallet_available_cents"), 0)
+    paid_out = _as_int_cents(user.get("wallet_paid_out_cents"), 0)
+    min_cents = get_min_payout_cents()
+    acct_id = user.get("stripe_connect_account_id")
+    has_account = bool(acct_id)
+    charges_enabled = False
+    payouts_enabled = False
+    details_submitted = False
+    connect_ready = False
+
+    if has_account and stripe_configured():
+        try:
+            acct = await asyncio.to_thread(retrieve_connect_account, acct_id)
+            charges_enabled = bool(getattr(acct, "charges_enabled", False))
+            payouts_enabled = bool(getattr(acct, "payouts_enabled", False))
+            details_submitted = bool(getattr(acct, "details_submitted", False))
+            connect_ready = _connect_account_can_receive(acct)
+        except stripe.error.StripeError as e:
+            logger.warning("wallet connect status: %s", e)
+
+    blocked = None
+    can_withdraw = False
+    if available < min_cents:
+        blocked = "below_minimum"
+    elif not has_account or not connect_ready:
+        blocked = "connect_required"
+    else:
+        can_withdraw = True
+
+    return {
+        "currency": STRIPE_CURRENCY_ENV,
+        "available_cents": available,
+        "paid_out_cents": paid_out,
+        "min_payout_cents": min_cents,
+        "min_payout_euros": round(min_cents / 100.0, 2),
+        "platform_fee_percent": get_platform_fee_percent(),
+        "can_withdraw": can_withdraw,
+        "withdraw_blocked_reason": blocked,
+        "has_account": has_account,
+        "charges_enabled": charges_enabled,
+        "payouts_enabled": payouts_enabled,
+        "details_submitted": details_submitted,
+        "connect_ready": connect_ready,
+        "connect_enabled": stripe_connect_enabled(),
+    }
+
+
+@api_router.post("/artist/wallet/payout")
+async def artist_wallet_payout(authorization: Optional[str] = Header(None), request: Request = None):
+    """Retire toute la cagnotte vers Stripe Connect (seuil minimum)."""
+    user = await get_current_user(authorization, request)
+    if user.get("role") != "artist":
+        raise HTTPException(status_code=403, detail="Réservé aux artistes")
+    ensure_stripe_available()
+    if not stripe_connect_enabled():
+        raise HTTPException(status_code=400, detail="Stripe Connect est désactivé")
+
+    min_cents = get_min_payout_cents()
+    available = _as_int_cents(user.get("wallet_available_cents"), 0)
+    if available < min_cents:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Retrait possible à partir de {min_cents / 100:.0f} € (cagnotte actuelle : {available / 100:.2f} €).",
+        )
+
+    acct_id = user.get("stripe_connect_account_id")
+    if not acct_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Active Stripe Connect pour retirer ta cagnotte.",
+        )
+    try:
+        acct = await asyncio.to_thread(retrieve_connect_account, acct_id)
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if not _connect_account_can_receive(acct):
+        raise HTTPException(
+            status_code=400,
+            detail="Termine l'activation Stripe Connect pour retirer ta cagnotte.",
+        )
+
+    amount = available
+    payout_id = f"payout_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    claimed = await db.users.find_one_and_update(
+        {"user_id": user["user_id"], "wallet_available_cents": amount},
+        {
+            "$inc": {
+                "wallet_available_cents": -amount,
+                "wallet_paid_out_cents": amount,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        raise HTTPException(status_code=409, detail="Cagnotte mise à jour pendant le retrait — réessaie.")
+
+    await db.artist_payouts.insert_one(
+        {
+            "payout_id": payout_id,
+            "artist_id": user["user_id"],
+            "amount_cents": amount,
+            "currency": STRIPE_CURRENCY_ENV,
+            "status": "pending",
+            "created_at": now,
+        }
+    )
+
+    try:
+        transfer = await asyncio.to_thread(
+            create_connect_transfer,
+            amount_cents=amount,
+            currency=STRIPE_CURRENCY_ENV,
+            destination=acct_id,
+            transfer_id=payout_id,
+            metadata={
+                "artist_id": str(user["user_id"]),
+                "payout_id": payout_id,
+            },
+        )
+    except stripe.error.StripeError as e:
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {
+                "$inc": {
+                    "wallet_available_cents": amount,
+                    "wallet_paid_out_cents": -amount,
+                }
+            },
+        )
+        await db.artist_payouts.update_one(
+            {"payout_id": payout_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "error": str(e),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        msg = getattr(e, "user_message", None) or getattr(e, "message", None) or str(e)
+        raise HTTPException(status_code=502, detail=f"Retrait Stripe impossible : {msg}")
+
+    transfer_id = getattr(transfer, "id", None)
+    await db.artist_payouts.update_one(
+        {"payout_id": payout_id},
+        {
+            "$set": {
+                "status": "transferred",
+                "stripe_transfer_id": transfer_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+    await db.wallet_ledger.insert_one(
+        {
+            "entry_id": f"wle_{uuid.uuid4().hex[:12]}",
+            "artist_id": user["user_id"],
+            "kind": "payout_debit",
+            "amount_cents": -amount,
+            "payout_id": payout_id,
+            "stripe_transfer_id": transfer_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    await log_transaction_event(
+        kind="artist_wallet_payout",
+        data={
+            "payout_id": payout_id,
+            "artist_id": user["user_id"],
+            "amount_cents": amount,
+            "currency": STRIPE_CURRENCY_ENV,
+            "stripe_transfer_id": transfer_id,
+        },
+    )
+    return {
+        "payout_id": payout_id,
+        "amount_cents": amount,
+        "currency": STRIPE_CURRENCY_ENV,
+        "stripe_transfer_id": transfer_id,
+        "available_cents": _as_int_cents(claimed.get("wallet_available_cents"), 0),
+        "paid_out_cents": _as_int_cents(claimed.get("wallet_paid_out_cents"), 0),
     }
 
 
@@ -4218,13 +5496,20 @@ async def get_artist_stats(authorization: Optional[str] = Header(None), request:
         free_tp = [p for p in t_purchases if purchase_amount_cents(p) == 0]
         track_plays = [p for p in plays_collection if p.get("track_id") == tid]
         play_n = max(len(track_plays), int(track.get("play_count") or 0))
+        duration_sec = _track_duration_sec(track)
         track_stats.append({
             "track_id": tid,
             "title": track["title"],
             "cover_url": track.get("cover_url"),
             "genre": track.get("genre"),
-            "price": track.get("price", 0),
+            "price": track.get("price") if track.get("price") is not None else 0,
+            "is_free_price": bool(track.get("is_free_price")),
+            "min_price": track.get("min_price") if track.get("is_free_price") else None,
             "status": track.get("status", "draft"),
+            "duration": duration_sec,
+            "duration_sec": duration_sec,
+            "file_url": track.get("file_url") or "",
+            "preview_url": track.get("preview_url") or "",
             "sales_count": len(paid_tp),
             "library_adds_count": len(free_tp),
             "revenue": sum(purchase_seller_net_cents(p) for p in paid_tp),
@@ -4243,14 +5528,27 @@ async def get_artist_stats(authorization: Optional[str] = Header(None), request:
         a_purchases = [p for p in purchases if p.get("item_type") == "album" and p["item_id"] == aid]
         paid_ap = [p for p in a_purchases if purchase_amount_cents(p) > 0]
         free_ap = [p for p in a_purchases if purchase_amount_cents(p) == 0]
-        tr_in_album = [t for t in tracks if t.get("album_id") == aid]
+        linked_ids = [tid for tid in (album.get("track_ids") or []) if tid]
+        tr_in_album = [
+            t for t in tracks
+            if t.get("album_id") == aid or t.get("track_id") in set(linked_ids)
+        ]
         play_sum = 0
         for t in tr_in_album:
             play_sum += len([p for p in plays_collection if p.get("track_id") == t["track_id"]])
+        duration_sec = sum(_track_duration_sec(t) or 0 for t in tr_in_album) or None
+        track_ids = _merge_album_track_ids(album, tracks)
         album_stats.append({
             "album_id": aid,
             "title": album["title"],
             "cover_url": album.get("cover_url"),
+            "price": album.get("price") if album.get("price") is not None else 0,
+            "is_free_price": bool(album.get("is_free_price")),
+            "min_price": album.get("min_price") if album.get("is_free_price") else None,
+            "track_ids": track_ids,
+            "track_count": len(track_ids),
+            "duration": duration_sec,
+            "duration_sec": duration_sec,
             "sales_count": len(paid_ap),
             "library_adds_count": len(free_ap),
             "revenue": sum(purchase_seller_net_cents(p) for p in paid_ap),
@@ -4316,6 +5614,33 @@ async def get_artist_stats(authorization: Optional[str] = Header(None), request:
         "top_tracks": top_tracks,
     }
 
+
+@api_router.post("/analytics/heartbeat")
+async def analytics_heartbeat(
+    payload: AnalyticsHeartbeat,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = None
+    try:
+        user = await get_current_user(authorization, request)
+    except HTTPException:
+        user = None
+    await record_heartbeat(db, payload, request, user)
+    return {"ok": True}
+
+
+@api_router.get("/admin/analytics")
+async def admin_analytics(
+    days: int = 30,
+    authorization: Optional[str] = Header(None),
+    request: Request = None,
+):
+    user = await get_current_user(authorization, request)
+    require_admin(user)
+    return await collect_site_analytics(db, days)
+
+
 @api_router.get("/artist/tracks")
 async def get_artist_tracks(authorization: Optional[str] = Header(None), request: Request = None):
     """Get all tracks for the logged-in artist"""
@@ -4343,6 +5668,8 @@ async def publish_track(track_id: str, authorization: Optional[str] = Header(Non
         raise HTTPException(status_code=403, detail="Not authorized")
     
     new_status = "published" if track.get("status") == "draft" else "draft"
+    if new_status == "published":
+        _ensure_published_has_audio({**track, "status": "published"})
     
     await db.tracks.update_one(
         {"track_id": track_id},
@@ -4367,11 +5694,14 @@ async def publish_album(album_id: str, authorization: Optional[str] = Header(Non
         raise HTTPException(status_code=403, detail="Not authorized")
 
     new_status = "published" if album.get("status") == "draft" else "draft"
+    if new_status == "published":
+        await _ensure_album_can_publish(album)
 
     await db.albums.update_one(
         {"album_id": album_id},
         {"$set": {"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
+    await _sync_album_tracks_status(album, status=new_status)
     await _safe_notify(maybe_notify_published("album", album.get("status"), {**album, "status": new_status}))
     return {"status": new_status, "message": f"Album {'published' if new_status == 'published' else 'unpublished'} successfully"}
 
@@ -4419,16 +5749,18 @@ async def search(q: str, types: str = "tracks,albums,artists", limit: int = 20):
 
     results = {"tracks": [], "albums": [], "artists": []}
 
+    published = {"status": {"$nin": ["draft"]}}
+
     if "tracks" in type_set:
-        tracks = await db.tracks.find(
-            {"status": "published", "$or": [{"title": regex}, {"artist_name": regex}, {"genre": regex}]},
-            {"_id": 0},
-        ).limit(limit).to_list(limit)
-        results["tracks"] = tracks
+        track_query = await _catalog_track_list_query(
+            {"$or": [{"title": regex}, {"artist_name": regex}, {"genre": regex}]}
+        )
+        tracks = await db.tracks.find(track_query, {"_id": 0}).limit(limit).to_list(limit)
+        results["tracks"] = [_public_track_doc(track) for track in tracks]
 
     if "albums" in type_set:
         albums = await db.albums.find(
-            {"$or": [{"title": regex}, {"artist_name": regex}]},
+            {**published, "$or": [{"title": regex}, {"artist_name": regex}, {"genre": regex}]},
             {"_id": 0},
         ).limit(limit).to_list(limit)
         results["albums"] = albums
@@ -4439,13 +5771,20 @@ async def search(q: str, types: str = "tracks,albums,artists", limit: int = 20):
             {"_id": 0, "password_hash": 0},
         ).limit(limit).to_list(limit)
         results["artists"] = artists
+        await _apply_custom_avatars(results["artists"])
 
     return results
 
 @app.get("/health")
 async def health_check():
     """Ping public (prod / navigateur), sans JWT."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "mail_configured": smtp_configured(),
+        "mail_host": SMTP_HOST or "",
+        "mail_from": SMTP_FROM_EMAIL or "",
+        "mail_port": SMTP_PORT,
+    }
 
 # Include router
 app.include_router(api_router)
@@ -4478,23 +5817,64 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+async def _backfill_audio_previews():
+    try:
+        cursor = db.tracks.find(
+            {},
+            {"_id": 0, "track_id": 1, "file_url": 1, "preview_url": 1, "artist_id": 1, "preview_start_time": 1, "preview_duration": 1},
+        )
+        fixed = 0
+        async for track in cursor:
+            file_url = track.get("file_url") or ""
+            preview_url = track.get("preview_url") or ""
+            if not file_url or (preview_url and preview_url != file_url):
+                continue
+            generated = await _preview_url_from_file_url(
+                file_url,
+                user_id=track.get("artist_id") or "",
+                start_sec=int(track.get("preview_start_time") or 0),
+                duration_sec=int(track.get("preview_duration") or 15),
+            )
+            if generated:
+                await db.tracks.update_one({"track_id": track["track_id"]}, {"$set": {"preview_url": generated}})
+                fixed += 1
+        if fixed:
+            logging.getLogger(__name__).info("Generated distinct previews for %s existing track(s)", fixed)
+    except Exception:
+        logging.getLogger(__name__).exception("Audio preview backfill skipped")
+
+
 @app.on_event("startup")
 async def sync_admin_emails_on_startup():
     wanted = admin_emails()
     logging.getLogger(__name__).info("ADMIN_EMAILS: %s", ", ".join(sorted(wanted)) or "(none)")
+    logging.getLogger(__name__).info(
+        "password-reset mail configured=%s from=%s host=%s",
+        smtp_configured(),
+        SMTP_FROM_EMAIL or "-",
+        SMTP_HOST or "-",
+    )
+    asyncio.create_task(_backfill_audio_previews())
+    asyncio.create_task(ensure_analytics_indexes(db))
     if not wanted:
         return
     try:
-        updated = 0
+        granted = 0
+        revoked = 0
         cursor = db.users.find({}, {"_id": 0, "user_id": 1, "email": 1, "is_admin": 1})
         async for user in cursor:
-            if user.get("is_admin"):
+            email = user.get("email") or ""
+            if is_unlisted_gmail_alias_of_admin(email) and user.get("is_admin"):
+                await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": False}})
+                revoked += 1
                 continue
-            if normalize_email(user.get("email") or "") in wanted:
+            if email_is_listed_admin(email) and not user.get("is_admin"):
                 await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"is_admin": True}})
-                updated += 1
-        if updated:
-            logging.getLogger(__name__).info("Granted is_admin to %s existing user(s)", updated)
+                granted += 1
+        if granted:
+            logging.getLogger(__name__).info("Granted is_admin to %s existing user(s)", granted)
+        if revoked:
+            logging.getLogger(__name__).info("Revoked is_admin from %s Gmail-alias user(s)", revoked)
     except Exception:
         logging.getLogger(__name__).exception(
             "Admin email sync skipped (Mongo unavailable). App still starts."
